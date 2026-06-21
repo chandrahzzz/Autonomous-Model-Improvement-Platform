@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  namespace: finetuning-pipeline
+data:
+  ENVIRONMENT: "production"
+  DEBUG: "false"
+  KAFKA_CONSUMER_GROUP: "finetuning-pipeline"
+  KAFKA_TOPIC_LLM_EVENTS: "llm.production.events"
+  KAFKA_TOPIC_TRAINING_EVENTS: "pipeline.training.events"
+  KAFKA_TOPIC_DLQ: "pipeline.dlq"
+  BASE_MODEL_NAME: "meta-llama/Meta-Llama-3-8B-Instruct"
+  TEACHER_MODEL: "gpt-4o"
+  TRAINING_TRIGGER_DATASET_SIZE: "500"
+  TRAINING_TRIGGER_DRIFT_THRESHOLD: "0.15"
+  TRAINING_MIN_INTERVAL_HOURS: "6"
+  LORA_R: "16"
+  LORA_ALPHA: "32"
+  EVAL_SET_SIZE: "200"
+  AB_MIN_REQUESTS: "1000"
+  AB_MIN_HOURS: "48"
+  WANDB_PROJECT: "continuous-finetuning"

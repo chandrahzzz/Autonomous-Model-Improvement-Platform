@@ -1,0 +1,10 @@
+[
+  { "source_id": "policy-refunds", "content": "Acme Co. refund policy: customers may request a full refund within 30 days of delivery, provided the item is unused and in its original packaging. Refunds are issued to the original payment method within 5 business days." },
+  { "source_id": "policy-shipping", "content": "Acme Co. ships domestic orders within one business day. Standard delivery arrives in three to five business days after dispatch. Expedited shipping (1-2 days) is available at checkout for an additional fee." },
+  { "source_id": "policy-support-hours", "content": "Acme Co. customer support operates Monday through Friday, 9 a.m. to 6 p.m. Eastern Time, excluding public holidays. Pro plan customers receive priority email support with a four-hour response target." },
+  { "source_id": "policy-plans", "content": "Acme Co. offers three subscription tiers: Basic, Pro, and Enterprise. The Pro plan includes priority support and advanced analytics. Annual billing receives a 20 percent discount compared to monthly billing." },
+  { "source_id": "policy-subscription-changes", "content": "Acme Co. subscribers can upgrade at any time with prorated charges applied immediately. Downgrades take effect at the start of the next billing cycle. Cancellations stop further charges; access continues until the end of the paid period." },
+  { "source_id": "policy-payments", "content": "Acme Co. accepts major credit cards, debit cards, and PayPal. Bank transfers are available only for annual enterprise contracts. A 14-day free trial of the Pro plan is available to new users with no credit card required." },
+  { "source_id": "policy-data-retention", "content": "Acme Co. retains account data for 30 days after account deletion to allow recovery, after which the data is permanently erased from active systems. Backups are purged within 90 days." },
+  { "source_id": "policy-returns-process", "content": "To return an item to Acme Co., start a return from the order page to receive a prepaid shipping label. Returns are inspected on arrival; approved refunds are processed within 5 business days of receipt." }
+]

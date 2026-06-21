@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-runner
+  namespace: finetuning-pipeline
+  labels:
+    app: pipeline-runner
+spec:
+  replicas: 1      # Single runner — LangGraph state is not horizontally scalable
+  selector:
+    matchLabels:
+      app: pipeline-runner
+  template:
+    metadata:
+      labels:
+        app: pipeline-runner
+    spec:
+      containers:
+        - name: pipeline-runner
+          image: ghcr.io/your-org/finetuning-pipeline:latest
+          command: ["python", "-m", "src.graph.runner"]
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+            - secretRef:
+                name: pipeline-secrets
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import asyncio; asyncio.run(__import__('src.db.connection', fromlist=['check_database_health']).check_database_health())"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+      restartPolicy: Always

@@ -1,0 +1,17 @@
+# Local dev overrides — not committed to production
+version: "3.9"
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: password
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  kafka:
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092

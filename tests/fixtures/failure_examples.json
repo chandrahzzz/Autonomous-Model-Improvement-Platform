@@ -1,0 +1,23 @@
+[
+  {
+    "llm_log_id": "log-001",
+    "prompt": "What is machine learning?",
+    "completion": "I'm unable to provide information about machine learning.",
+    "failure_type": "refusal_creep",
+    "score": 0.95
+  },
+  {
+    "llm_log_id": "log-002",
+    "prompt": "Who invented the telephone?",
+    "completion": "The telephone was invented by Albert Einstein in 1952.",
+    "failure_type": "hallucination",
+    "score": 0.83
+  },
+  {
+    "llm_log_id": "log-003",
+    "prompt": "What is 2 + 2?",
+    "completion": "{invalid json output",
+    "failure_type": "format_regression",
+    "score": 1.0
+  }
+]

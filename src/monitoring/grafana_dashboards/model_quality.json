@@ -1,0 +1,65 @@
+{
+  "title": "Model Quality Metrics",
+  "uid": "model-quality",
+  "version": 1,
+  "schemaVersion": 38,
+  "refresh": "1m",
+  "panels": [
+    {
+      "id": 1,
+      "title": "RAGAS Faithfulness",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "eval_faithfulness", "legendFormat": "faithfulness"}
+      ],
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}}
+    },
+    {
+      "id": 2,
+      "title": "RAGAS Answer Relevancy",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "targets": [
+        {"expr": "eval_answer_relevancy", "legendFormat": "answer_relevancy"}
+      ],
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}}
+    },
+    {
+      "id": 3,
+      "title": "RAGAS Context Recall",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+      "targets": [
+        {"expr": "eval_context_recall", "legendFormat": "context_recall"}
+      ],
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}}
+    },
+    {
+      "id": 4,
+      "title": "Training Final Loss",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "training_final_loss", "legendFormat": "loss"}
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Shadow Traffic Quality Delta",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, rate(shadow_quality_delta_bucket[5m]))",
+          "legendFormat": "p50 delta"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(shadow_quality_delta_bucket[5m]))",
+          "legendFormat": "p95 delta"
+        }
+      ]
+    }
+  ],
+  "time": {"from": "now-24h", "to": "now"}
+}

@@ -1,0 +1,118 @@
+{
+  "title": "Continuous Fine-Tuning Pipeline Overview",
+  "uid": "pipeline-overview",
+  "version": 1,
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "LLM Calls / min",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "rate(llm_calls_total[1m]) * 60",
+          "legendFormat": "calls/min"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "LLM Latency p99 (s)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(llm_latency_seconds_bucket[5m]))",
+          "legendFormat": "p99 latency"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Failures Detected",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "rate(failures_detected_total[5m]) * 60",
+          "legendFormat": "{{failure_type}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Rolling Drift Score",
+      "type": "gauge",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "drift_rolling_score",
+          "legendFormat": "drift score"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "yellow", "value": 0.1},
+              {"color": "red", "value": 0.15}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Training Examples Pending",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+      "targets": [
+        {"expr": "training_examples_pending", "legendFormat": "pending"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Model Promotions Total",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 16},
+      "targets": [
+        {"expr": "model_promotions_total", "legendFormat": "promotions"}
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Model Rollbacks Total",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
+      "targets": [
+        {"expr": "model_rollbacks_total", "legendFormat": "rollbacks"}
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Safety Score",
+      "type": "gauge",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 16},
+      "targets": [
+        {"expr": "eval_safety_score", "legendFormat": "safety"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              {"color": "red", "value": 0},
+              {"color": "yellow", "value": 0.95},
+              {"color": "green", "value": 1.0}
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "time": {"from": "now-1h", "to": "now"}
+}

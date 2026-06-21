@@ -1,0 +1,185 @@
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Literal
+import secrets
+import json
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # Environment
+    environment: Literal["development", "staging", "production"] = "development"
+    debug: bool = False
+    secret_key: str = Field(default_factory=lambda: secrets.token_hex(32))
+
+    # Database
+    database_url: str = "postgresql+asyncpg://pipeline:password@localhost:5432/finetuning_pipeline"
+    database_pool_size: int = 20
+    database_max_overflow: int = 10
+    database_pool_timeout: int = 30
+
+    # Redis
+    redis_url: str = "redis://localhost:6379/0"
+    redis_max_connections: int = 50
+
+    # Kafka
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_consumer_group: str = "finetuning-pipeline"
+    kafka_topic_llm_events: str = "llm.production.events"
+    kafka_topic_training_events: str = "pipeline.training.events"
+    kafka_topic_dlq: str = "pipeline.dlq"
+
+    # LLM
+    openai_api_key: str = ""
+    langsmith_api_key: str = ""
+    langsmith_project: str = "continuous-finetuning"
+    base_model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct"
+    teacher_model: str = "gpt-4o"
+
+    # Training Trigger
+    training_trigger_dataset_size: int = 500
+    training_trigger_drift_threshold: float = 0.15
+    training_min_interval_hours: int = 6
+
+    # LoRA
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: list[str] = ["q_proj", "v_proj"]
+    lora_training_epochs: int = 3
+    lora_learning_rate: float = 2e-4
+    lora_batch_size: int = 4
+    lora_gradient_accumulation: int = 4
+
+    # Evaluation
+    eval_set_size: int = 200
+    eval_improvement_threshold: float = 0.03
+    eval_safety_battery_size: int = 100
+    min_eval_examples: int = 50  # Absolute floor before an eval run is trusted
+    ab_shadow_traffic_pct: float = 0.10
+    ab_min_requests: int = 1000
+    ab_min_hours: float = 48.0
+    ab_pvalue_threshold: float = 0.05
+    ab_cohens_d_threshold: float = 0.10
+    # Shadow quality scoring (replaces the old circular self-comparison metric)
+    shadow_scoring_strategy: Literal["reference_rouge", "llm_judge"] = "llm_judge"
+    shadow_reference_sim_threshold: float = 0.85
+    shadow_judge_model: str = "gpt-4o-mini"
+
+    # Detection
+    hallucination_threshold: float = 0.50  # NLI: flag if mean non-entailment > this
+    drift_mahalanobis_threshold: float = 0.15
+    drift_baseline_min_samples: int = 500
+    refusal_rate_multiplier: float = 2.0
+    format_kl_threshold: float = 0.5
+
+    # Continuous eval factory (RFC-002) — purely additive, off via the flag.
+    eval_factory_enabled: bool = True
+    eval_factory_trigger_every_n_requests: int = 1000
+    eval_factory_max_eval_set_size: int = 500
+    eval_factory_min_confidence: float = 0.80
+    eval_factory_max_examples_per_run: int = 10
+    eval_factory_dedup_cosine_threshold: float = 0.90
+    eval_factory_request_counter_key: str = "pipeline:eval_factory:request_count"
+
+    # Domain knowledge retrieval — lets the grounded teacher fetch context when
+    # the upstream app didn't attach `retrieved_context`. Additive, off via flag.
+    retrieval_enabled: bool = True
+    retrieval_top_k: int = 3
+    # MiniLM cosine: genuinely-relevant domain queries score ~0.38-0.42, off-topic
+    # queries score < 0.05 — so 0.30 grounds real matches while rejecting noise.
+    retrieval_min_similarity: float = 0.30
+    retrieval_max_context_chars: int = 4000
+
+    # Failure attribution (RFC-003) — purely additive, off via the flag.
+    attribution_enabled: bool = True
+    attribution_top_k: int = 10
+    attribution_max_candidates: int = 500
+    attribution_max_failures_per_cycle: int = 3
+    attribution_retention_days: int = 30
+
+    # Predictive drift early warning (RFC-001) — purely additive, off via the flag.
+    drift_prediction_enabled: bool = True
+    drift_alert_horizon_hours: float = 24.0
+    drift_min_window_for_prediction: int = 50
+    drift_prediction_interval_cycles: int = 5
+    drift_trend_redis_key: str = "pipeline:drift_trend"
+    drift_trend_redis_ttl_seconds: int = 3600
+    drift_alert_dedupe_seconds: int = 7200
+
+    # Curation
+    teacher_confidence_threshold: float = 0.85
+    teacher_consistency_temperature: float = 0.7  # >0 so self-consistency votes differ
+    max_concurrent_teacher_calls: int = 20
+    curation_cost_budget_usd: float = 25.0  # Per-run circuit breaker
+    dedup_jaccard_threshold: float = 0.85
+    quality_rouge_threshold: float = 0.30
+    pii_fail_closed: bool = True
+
+    # Safety classifier
+    safety_classifier: Literal["llama_guard", "keyword_fallback"] = "llama_guard"
+    together_api_key: str = ""
+    llama_guard_model: str = "meta-llama/Meta-Llama-Guard-3-8B"
+
+    # Threshold calibration
+    allow_auto_calibration: bool = False   # suggest-only unless True
+    calibration_fp_target: float = 0.30    # tolerated curation drop-rate (FP proxy)
+    calibration_step: float = 0.05
+    calibration_interval_cycles: int = 100
+    calibration_min_samples: int = 20
+
+    # Canary (live partial rollout before full promotion)
+    # Off by default: it requires a serving layer to call CanaryController.record_result.
+    # When enabled without that integration, promotions are gated until verified.
+    canary_enabled: bool = False
+    canary_traffic_pct: float = 0.05
+    canary_window_minutes: int = 60
+    canary_min_requests: int = 50
+    canary_max_error_rate: float = 0.01
+
+    # Cost controls
+    monthly_budget_usd: float = 500.0
+    single_run_budget_usd: float = 50.0
+    modal_a100_hourly_usd: float = 4.0  # Estimated A100 rate for GPU cost tracking
+
+    # Audit
+    vault_url: str = "http://localhost:8200"
+    vault_token: str = "root"
+    hmac_key_path: str = "secret/pipeline/hmac_key"
+    vault_required: bool = True  # Production: fail loudly if Vault is unreachable
+
+    # Monitoring
+    pagerduty_api_key: str = ""
+    pagerduty_service_id: str = ""
+    wandb_api_key: str = ""
+    wandb_project: str = "continuous-finetuning"
+
+    # Modal
+    modal_token_id: str = ""
+    modal_token_secret: str = ""
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def validate_db_url(cls, v: str) -> str:
+        if not v.startswith("postgresql+asyncpg://"):
+            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
+
+    @field_validator("lora_target_modules", mode="before")
+    @classmethod
+    def parse_target_modules(cls, v: object) -> list[str]:
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                return [m.strip() for m in v.split(",")]
+        return v  # type: ignore[return-value]
+
+
+settings = Settings()

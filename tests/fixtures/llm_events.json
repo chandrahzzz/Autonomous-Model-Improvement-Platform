@@ -1,0 +1,41 @@
+[
+  {
+    "event_id": "evt-001",
+    "session_id": "sess-001",
+    "user_cohort": "default",
+    "model_version": "v7",
+    "prompt": "What is the capital of France?",
+    "completion": "The capital of France is Paris.",
+    "prompt_tokens": 9,
+    "completion_tokens": 7,
+    "latency_ms": 230,
+    "finish_reason": "stop",
+    "cost_usd": 0.00042
+  },
+  {
+    "event_id": "evt-002",
+    "session_id": "sess-002",
+    "user_cohort": "beta",
+    "model_version": "v7",
+    "prompt": "Explain quantum entanglement.",
+    "completion": "I'm sorry, I can't help with physics questions.",
+    "prompt_tokens": 5,
+    "completion_tokens": 11,
+    "latency_ms": 180,
+    "finish_reason": "stop",
+    "cost_usd": 0.00028
+  },
+  {
+    "event_id": "evt-003",
+    "session_id": "sess-003",
+    "user_cohort": "default",
+    "model_version": "v7",
+    "prompt": "Summarize the French Revolution.",
+    "completion": "The French Revolution was a period of radical political and societal change in France from 1789 to 1799.",
+    "prompt_tokens": 7,
+    "completion_tokens": 22,
+    "latency_ms": 410,
+    "finish_reason": "stop",
+    "cost_usd": 0.00085
+  }
+]
