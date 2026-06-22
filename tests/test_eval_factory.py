@@ -19,6 +19,7 @@ def make_factory(
     }
     eval_repo.exists_similar.return_value = exists_similar
     eval_repo.evict_oldest.return_value = 1
+    eval_repo.evict_weighted.return_value = 1
     eval_repo.insert_factory_example.return_value = MagicMock()
 
     openai = AsyncMock()
@@ -141,7 +142,8 @@ async def test_try_generate_evicts_when_at_cap():
             with patch_settings(max_size=500):
                 result = await factory._try_generate_example(0, ["Some prompt"] * 5, AsyncMock())
     assert result is True
-    eval_repo.evict_oldest.assert_called_once_with(count=1)
+    eval_repo.evict_weighted.assert_called_once()
+    assert eval_repo.evict_weighted.call_args.kwargs["count"] == 1
     eval_repo.insert_factory_example.assert_called_once()
 
 

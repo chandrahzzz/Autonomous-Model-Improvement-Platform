@@ -30,6 +30,79 @@ def _rollback_state(state: PipelineState, reason: str) -> PipelineState:
     }
 
 
+async def _stub_invoke(prompt: str) -> str:
+    return f"This is a safe and helpful response to: {prompt}"
+
+
+async def _build_invoke_fns(state: PipelineState):
+    """Returns (challenger_fn, incumbent_fn, mode).
+
+    Production (EVAL_REAL_INFERENCE): challenger = base + trained adapter merged;
+    incumbent = base + the current production adapter (for same-set re-eval).
+    Returns (None, ...) when real inference is required but no adapter path exists.
+    Dev: returns the stub for the challenger and no incumbent fn.
+    """
+    if not settings.eval_real_inference:
+        return _stub_invoke, None, "stub"
+
+    lora_path = state.get("lora_weights_path")
+    if not lora_path:
+        return None, None, "real"
+
+    from src.inference.challenger import build_challenger_invoke_fn, build_base_invoke_fn
+    base_model = state.get("base_model") or settings.base_model_name
+    challenger_fn = build_challenger_invoke_fn(base_model, lora_path)
+
+    # Incumbent = current production model (its adapter if any, else the base).
+    incumbent_fn = None
+    try:
+        from src.db.repositories.model_versions import ModelRepository
+        async with get_db() as db:
+            prod = await ModelRepository(db).get_production_version()
+        prod_adapter = getattr(prod, "lora_weights_path", None) if prod else None
+        incumbent_fn = (
+            build_challenger_invoke_fn(base_model, prod_adapter) if prod_adapter
+            else build_base_invoke_fn(base_model)
+        )
+    except Exception:
+        log.warning("incumbent_invoke_build_failed")
+    return challenger_fn, incumbent_fn, "real"
+
+
+async def _verify_adapter(state, challenger_invoke, incumbent_invoke, mode) -> str | None:
+    """Confirm the challenger differs from the base model (adapter applied).
+    Returns a rollback reason string if it must be blocked, else None."""
+    from src.monitoring.metrics import challenger_adapter_checks_total
+
+    if mode != "real":
+        # Dev stub: only enforce in production.
+        if settings.environment == "production" and settings.eval_require_adapter_verification:
+            challenger_adapter_checks_total.labels(result="skipped").inc()
+            return ("adapter_verification_required_in_production: real inference is "
+                    "off, refusing to gate on a stub model.")
+        challenger_adapter_checks_total.labels(result="skipped").inc()
+        return None
+
+    try:
+        from src.inference.challenger import build_base_invoke_fn, verify_adapter_distinct
+        base_model = state.get("base_model") or settings.base_model_name
+        base_fn = build_base_invoke_fn(base_model)
+        distinct, _details = await verify_adapter_distinct(challenger_invoke, base_fn)
+    except Exception:
+        log.exception("adapter_verification_error")
+        challenger_adapter_checks_total.labels(result="error").inc()
+        if settings.environment == "production" and settings.eval_require_adapter_verification:
+            return "adapter_verification_error: could not confirm the adapter was applied."
+        return None
+
+    if not distinct:
+        challenger_adapter_checks_total.labels(result="identical").inc()
+        return ("adapter_not_applied: challenger output is identical to the base "
+                "model on all probes — the LoRA adapter was not applied or is a no-op.")
+    challenger_adapter_checks_total.labels(result="verified").inc()
+    return None
+
+
 async def eval_runner_node(state: PipelineState) -> PipelineState:
     version_tag = state.get("version_tag", "unknown")
     lora_path = state.get("lora_weights_path")
@@ -55,9 +128,28 @@ async def eval_runner_node(state: PipelineState) -> PipelineState:
                 f"required. Run scripts/seed_eval_set.py.",
             )
 
-    # Mock invoke fn — in production loads the actual LoRA adapter
-    async def challenger_invoke(prompt: str) -> str:
-        return f"This is a safe and helpful response to: {prompt}"
+    # Build the challenger (and incumbent) invocation paths. In production this
+    # loads the base model + the trained LoRA adapter (merge_and_unload); in dev
+    # it falls back to a stub. Either way, the adapter-applied check below gates
+    # the run so scores are never trusted from the wrong model (#T1).
+    challenger_invoke, incumbent_invoke, mode = await _build_invoke_fns(state)
+    if challenger_invoke is None:
+        return _rollback_state(
+            state,
+            "real_inference_required: EVAL_REAL_INFERENCE is on but no LoRA adapter "
+            "path is available for the challenger.",
+        )
+
+    # Hard gate: verify the adapter actually changed the model vs. the base.
+    verify = await _verify_adapter(state, challenger_invoke, incumbent_invoke, mode)
+    if verify is not None:
+        return _rollback_state(state, verify)
+
+    # Lock the eval-set snapshot (the exact ids scored) for auditability and
+    # apples-to-apples incumbent comparison (#E2).
+    snapshot_ids = [
+        e["id"] for e in eval_set if isinstance(e, dict) and e.get("id") is not None
+    ]
 
     async with get_db() as db:
         eval_repo = EvalRunRepository(db)
@@ -72,7 +164,11 @@ async def eval_runner_node(state: PipelineState) -> PipelineState:
         challenger_invoke_fn=challenger_invoke,
         incumbent_scores=incumbent_scores or None,
         eval_set=eval_set,
+        incumbent_invoke_fn=incumbent_invoke,
     )
+    eval_result.rationale["eval_set_snapshot_ids"] = snapshot_ids
+    eval_result.rationale["eval_set_snapshot_size"] = len(snapshot_ids)
+    eval_result.rationale["inference_mode"] = mode
 
     async with get_db() as db:
         eval_repo = EvalRunRepository(db)

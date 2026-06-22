@@ -105,9 +105,18 @@ def passes_significance_gate(
         metrics["fail_reason"] = "empty_score_arrays"
         return False, metrics
 
+    quality_delta = float(np.mean(challenger_scores) - np.mean(production_scores))
+
+    # Explicit regression guard (#E4): block a clearly-worse challenger before the
+    # one-sided significance test (which would just report "not significant").
+    if quality_delta < 0:
+        from src.monitoring.metrics import challenger_regression_blocks_total
+        challenger_regression_blocks_total.inc()
+        metrics.update({"quality_delta": _round_safe(quality_delta), "fail_reason": "challenger_regression"})
+        return False, metrics
+
     t_stat, p_val = welch_t_test(production_scores, challenger_scores)
     d = cohens_d(production_scores, challenger_scores)
-    quality_delta = float(np.mean(challenger_scores) - np.mean(production_scores))
 
     metrics.update({
         "t_statistic": _round_safe(t_stat),
@@ -154,6 +163,16 @@ def passes_significance_gate_from_deltas(
     deltas = np.asarray(quality_deltas, dtype=float)
     mean_delta = float(deltas.mean())
     std_delta = float(deltas.std(ddof=1))
+
+    # Explicit regression guard (#E4): a one-sided test (H1: challenger > prod)
+    # gives a clearly-worse challenger a high p-value (not significant), so without
+    # this it could only be caught downstream. Block immediately and unambiguously
+    # when the mean delta is negative — a worse model must never reach promotion.
+    if mean_delta < 0:
+        from src.monitoring.metrics import challenger_regression_blocks_total
+        challenger_regression_blocks_total.inc()
+        metrics.update({"quality_delta": _round_safe(mean_delta), "fail_reason": "challenger_regression"})
+        return False, metrics
 
     if std_delta == 0:
         # Constant deltas: significant iff strictly positive.

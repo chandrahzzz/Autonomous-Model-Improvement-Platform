@@ -156,6 +156,12 @@ All configuration is in `.env`. Key variables:
 | `TEACHER_SEMANTIC_CONSISTENCY_THRESHOLD` | 0.80 | MiniLM-cosine agreement needed across the 3 teacher votes |
 | `TEACHER_MAX_RETRIES` | 5 | Exponential-backoff retries on OpenAI 429 / timeout before dropping |
 | `DEDUP_REHYDRATE_ENABLED` | true | Rebuild the MinHash near-dup index from the DB on startup |
+| `EVAL_REAL_INFERENCE` | false | Load base+LoRA (merge_and_unload) for eval; must be on in prod |
+| `EVAL_REQUIRE_ADAPTER_VERIFICATION` | true | Block promotion if the challenger ≡ base model (adapter no-op) |
+| `EVAL_LOCK_SET_SNAPSHOT` | true | Re-evaluate the incumbent on the same eval-set snapshot for a fair delta |
+| `SAFETY_REQUIRE_CLASSIFIER` | true | Fail-closed in prod when Llama Guard is unavailable (no keyword fallback) |
+| `TRIGGER_DRIFT_EXEMPT_FAILURE_TYPES` | format_regression, refusal_creep | Failure types that can trigger training without crossing the drift threshold |
+| `REPLAY_RECENCY_DECAY` | 0.9 | Exponential decay favouring recent known-good logs in the replay buffer |
 
 ### Detection-layer hardening (June 2026)
 Six production gaps in the failure-detection layer were closed (plus a real
@@ -183,6 +189,25 @@ Five production gaps in the curation pipeline were closed. All additive and kill
   early-deployment batches still cluster; all-noise batches bypass cleanly (`clustering_bypassed_total`).
 - **Restart-safe dedup** — the MinHash near-duplicate index rehydrates from the DB on
   startup so near-dupes (that the exact-hash DB index can't catch) don't re-enter after a restart.
+
+### Training + evaluation hardening (June 2026)
+Eight production gaps in the training/eval systems were closed. All additive and kill-switched:
+- **Eval runs on the real merged model** — the eval node loads base + LoRA
+  (`merge_and_unload`) and **verifies the challenger differs from the base** before trusting any score; a no-op adapter blocks promotion (`src/inference/challenger.py`).
+- **Apples-to-apples deltas** — the eval-set snapshot is locked per run and the
+  incumbent is re-evaluated on the *same* set, so a RAGAS delta reflects the model, not eval-set drift.
+- **Safety gate fails closed** — in production an unavailable Llama Guard blocks
+  promotion instead of using brittle keywords; the keyword fallback no longer passes "I'm sorry, but here's how to…".
+- **Trigger catches structural regressions** — format/refusal-dominant backlogs can
+  trigger training on example count alone (drift is a soft gate for those types).
+- **Recency-weighted replay** — known-good replay examples favour recent production
+  logs (exponential decay) and the version distribution is recorded per run.
+- **Durable dataset artifact** — the dataset is uploaded to the Modal Volume and
+  confirmed resolvable *before* submit, so `dataset_uri` never dangles on a failed run.
+- **Confidence-weighted eval eviction** — the eval factory evicts the lowest-confidence
+  quartile first (LRU within), not pure LRU, so high-value rare examples survive.
+- **Regression guard** — a challenger with a negative mean quality delta is blocked
+  immediately, before the one-sided significance test.
 
 ---
 
@@ -294,7 +319,7 @@ make test-integration
 make test-cov
 ```
 
-**Suite status:** 137 tests collected. 131 pass locally with no external services.
+**Suite status:** 154 tests collected. 148 pass locally with no external services.
 The 6 `tests/integration/test_audit_integrity.py` + `test_pipeline_cycle.py` HMAC
 tests require a running Vault — they **fail loudly by design** when
 `VAULT_REQUIRED=true` and Vault is unreachable (this is the fail-closed audit

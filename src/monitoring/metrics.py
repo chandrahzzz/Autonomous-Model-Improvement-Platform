@@ -147,6 +147,31 @@ eval_faithfulness_gauge = Gauge("eval_faithfulness", "RAGAS faithfulness score")
 eval_relevancy_gauge = Gauge("eval_answer_relevancy", "RAGAS answer relevancy score")
 eval_recall_gauge = Gauge("eval_context_recall", "RAGAS context recall score")
 eval_safety_gauge = Gauge("eval_safety_score", "Safety battery pass rate")
+
+# ── Training / evaluation hardening (June 2026) ────────────────────────────────
+challenger_adapter_checks_total = Counter(
+    "challenger_adapter_checks_total",
+    "Adapter-applied verification checks before eval",
+    ["result"],  # verified | identical | skipped | error
+)
+safety_classifier_unavailable_blocks_total = Counter(
+    "safety_classifier_unavailable_blocks_total",
+    "Responses blocked (treated unsafe) because the safety classifier was "
+    "unavailable and a real classifier is required",
+)
+eval_incumbent_reeval_total = Counter(
+    "eval_incumbent_reeval_total",
+    "Incumbent re-evaluations on the locked eval-set snapshot for a fair delta",
+)
+training_trigger_drift_exempt_total = Counter(
+    "training_trigger_drift_exempt_total",
+    "Training triggers fired on example count alone (format/refusal-dominant, "
+    "drift gate exempted)",
+)
+challenger_regression_blocks_total = Counter(
+    "challenger_regression_blocks_total",
+    "Promotions blocked early because the challenger's mean quality delta was negative",
+)
 teacher_model_cost_usd = Gauge(
     "teacher_model_cost_usd", "Estimated teacher (GPT-4o) spend on the last curation run"
 )

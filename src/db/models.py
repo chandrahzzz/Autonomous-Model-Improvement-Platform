@@ -113,6 +113,7 @@ class TrainingRun(Base):
     dataset_path = Column(Text)
     dataset_uri = Column(Text)  # Durable, reproducible pointer to the exact dataset
     lora_config = Column(JSONB, nullable=False)
+    replay_distribution = Column(JSONB)  # {model_version: count} of replay examples (#T2)
     final_loss = Column(Float)
     wandb_run_id = Column(Text)
     wandb_run_url = Column(Text)

@@ -40,6 +40,18 @@ class TrainingExampleRepository:
         )
         return [(r[0], r[1]) for r in result.fetchall()]
 
+    async def pending_failure_type_counts(self) -> dict[str, int]:
+        """{failure_type: count} over pending (not-yet-used, non-retracted)
+        examples — lets the trigger detect a format/refusal-dominant regression
+        that never crosses the drift threshold (#T3)."""
+        result = await self._db.execute(
+            select(TrainingExample.failure_type, func.count())
+            .where(TrainingExample.included_in_run.is_(None))
+            .where(TrainingExample.retracted_at.is_(None))
+            .group_by(TrainingExample.failure_type)
+        )
+        return {row[0]: int(row[1]) for row in result.fetchall() if row[0]}
+
     async def get_pending(self, limit: int = 2000) -> list[TrainingExample]:
         result = await self._db.execute(
             select(TrainingExample)

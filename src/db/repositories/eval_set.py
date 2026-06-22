@@ -85,6 +85,52 @@ class EvalSetRepository:
         )
         return result.rowcount or 0
 
+    async def evict_weighted(self, count: int, low_conf_quartile: float = 0.25) -> int:
+        """Confidence-weighted eviction (#E3): evict from the lowest-confidence
+        quartile of FACTORY rows first (LRU within that quartile), only falling
+        back to overall LRU if the quartile can't supply enough. This stops pure
+        LRU from discarding high-confidence rare-category examples while keeping
+        low-quality but frequently-sampled ones. Seed rows are never touched."""
+        if count <= 0:
+            return 0
+        rows = (await self._db.execute(
+            select(EvalSet.id, EvalSet.factory_confidence, EvalSet.last_accessed_at)
+            .where(EvalSet.source == "factory", EvalSet.evicted_at.is_(None))
+        )).fetchall()
+        if not rows:
+            return 0
+
+        triples = [(r.id, r.factory_confidence, r.last_accessed_at) for r in rows]
+        victims = self._select_eviction_victims(triples, count, low_conf_quartile)
+        if not victims:
+            return 0
+        result = await self._db.execute(
+            update(EvalSet).where(EvalSet.id.in_(victims)).values(evicted_at=func.now())
+        )
+        return result.rowcount or 0
+
+    @staticmethod
+    def _select_eviction_victims(rows, count: int, low_conf_quartile: float) -> list:
+        """Pure victim selection: lowest-confidence quartile first (LRU within),
+        then overall LRU. ``rows`` is a list of (id, confidence, last_accessed_at).
+        NULLS FIRST for last_accessed (never-accessed rows go first)."""
+        if count <= 0 or not rows:
+            return []
+        confidences = [c for (_id, c, _la) in rows if c is not None]
+        threshold = float(np.quantile(confidences, low_conf_quartile)) if confidences else None
+
+        def _lru_key(row):
+            _id, _conf, last_accessed = row
+            return (last_accessed is not None, last_accessed)
+
+        if threshold is not None:
+            low_conf = [r for r in rows if (r[1] or 0.0) <= threshold]
+            rest = [r for r in rows if (r[1] or 0.0) > threshold]
+        else:
+            low_conf, rest = list(rows), []
+        ordered = sorted(low_conf, key=_lru_key) + sorted(rest, key=_lru_key)
+        return [r[0] for r in ordered[:count]]
+
     async def count_active_by_source(self) -> dict[str, int]:
         result = await self._db.execute(
             select(EvalSet.source, func.count())

@@ -83,3 +83,33 @@ class LLMLogRepository:
             params,
         )
         return list(result.fetchall())
+
+    async def get_known_good_candidates(
+        self, limit: int, model_version: str | None = None
+    ) -> list[LLMLog]:
+        """Known-good logs ordered NEWEST first (not random) so a caller can apply
+        recency-weighted sampling (#T2). Same clean/complete filters as
+        get_known_good_sample."""
+        params: dict[str, Any] = {"limit": limit}
+        version_clause = ""
+        if model_version:
+            version_clause = "AND l.model_version = :model_version"
+            params["model_version"] = model_version
+        result = await self._db.execute(
+            text(
+                f"""
+                SELECT l.* FROM llm_logs l
+                WHERE l.finish_reason = 'stop'
+                  AND l.latency_ms < 3000
+                  {version_clause}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM failure_classifications fc
+                      WHERE fc.llm_log_id = l.id
+                  )
+                ORDER BY l.created_at DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        )
+        return list(result.fetchall())

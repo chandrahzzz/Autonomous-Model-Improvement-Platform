@@ -46,6 +46,35 @@ class DatasetBuilder:
         self._model_repo = ModelRepository(db)
         self._log_repo = LLMLogRepository(db)
         self._tokenizer = self._load_tokenizer()
+        # Populated by build(): {model_version: count} of the replay examples used,
+        # so the training run can audit which versions its replay buffer came from.
+        self.last_replay_distribution: dict[str, int] = {}
+
+    @staticmethod
+    def _recency_weighted_sample(candidates: list, n: int, decay: float) -> list:
+        """Sample up to ``n`` items without replacement, weighting newer items
+        (earlier in the newest-first list) higher via exponential decay over rank.
+        decay<1 favours recent logs; decay==1 is uniform."""
+        if n <= 0 or not candidates:
+            return []
+        if n >= len(candidates):
+            return list(candidates)
+        weights = [decay ** rank for rank in range(len(candidates))]
+        pool = list(zip(candidates, weights))
+        chosen = []
+        for _ in range(n):
+            total = sum(w for _, w in pool)
+            if total <= 0:
+                break
+            r = random.uniform(0, total)
+            acc = 0.0
+            for idx, (item, w) in enumerate(pool):
+                acc += w
+                if acc >= r:
+                    chosen.append(item)
+                    pool.pop(idx)
+                    break
+        return chosen
 
     def _load_tokenizer(self):
         """Load the base model's tokenizer for chat-template formatting.
@@ -106,11 +135,18 @@ class DatasetBuilder:
         n_failure = len(records)
         n_replay = int(n_failure * replay_ratio / (1 - replay_ratio)) if replay_ratio < 1 else 0
         replay_added = 0
+        self.last_replay_distribution = {}
         if n_replay > 0:
             prod = await self._model_repo.get_production_version()
             prod_version = prod.version_tag if prod else None
-            good = await self._log_repo.get_known_good_sample(
-                limit=n_replay, model_version=prod_version
+            # Oversample a newest-first candidate pool, then recency-weight the
+            # draw so older (weaker-model) logs contribute less (#T2).
+            pool_size = n_replay * max(1, settings.replay_candidate_pool_multiplier)
+            candidates = await self._log_repo.get_known_good_candidates(
+                limit=pool_size, model_version=prod_version
+            )
+            good = self._recency_weighted_sample(
+                candidates, n_replay, settings.replay_recency_decay
             )
             for row in good:
                 records.append({
@@ -118,6 +154,10 @@ class DatasetBuilder:
                     "source": "replay",
                     "failure_type": "none",
                 })
+                ver = getattr(row, "model_version", None) or "unknown"
+                self.last_replay_distribution[ver] = (
+                    self.last_replay_distribution.get(ver, 0) + 1
+                )
             replay_added = len(good)
 
         random.shuffle(records)

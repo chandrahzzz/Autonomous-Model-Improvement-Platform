@@ -219,6 +219,59 @@
   once on the first cycle from `TrainingExampleRepository.all_for_dedup()` (newest
   `DEDUP_REHYDRATE_LIMIT`=50k). Gauge `dedup_index_size`. Off via `DEDUP_REHYDRATE_ENABLED`.
 
+### Training + evaluation hardening (June 2026) — closes 8 production gaps
+> Additive + kill-switched. Settings in the **Training Trigger / Evaluation**
+> blocks of `settings.py`. Tests: `tests/test_training_eval_hardening.py` (17).
+> Migration **010** adds `training_runs.replay_distribution` (JSONB). Head = 010.
+- **#T1 Eval ran on a STUB, never the trained model** (`graph/nodes/eval_runner.py`,
+  new `src/inference/challenger.py`): the node's `challenger_invoke` returned a
+  hardcoded string — promotion gates scored a model that was never the adapter.
+  Added `HFModelRunner` that loads the base model + LoRA adapter via
+  **`merge_and_unload()`**, and `verify_adapter_distinct()` which runs probe prompts
+  through challenger vs. base and **blocks the run** (rollback `adapter_not_applied`)
+  if outputs are identical (adapter no-op). Gated by `EVAL_REAL_INFERENCE` (dev keeps
+  the stub but, in production, `EVAL_REQUIRE_ADAPTER_VERIFICATION` forces a real
+  model). Counter `challenger_adapter_checks_total{result}`.
+- **#E2 Eval-set drift made deltas meaningless** (`eval_orchestrator.py`,
+  `eval_runner.py`): the factory grows the eval set between runs, so a stored
+  incumbent score wasn't comparable. Now the eval node locks the exact eval-set
+  **snapshot ids** (recorded in `eval_runs.rationale`) and the orchestrator
+  **re-evaluates the incumbent on the SAME set** (`incumbent_invoke_fn`) for an
+  apples-to-apples delta. `EVAL_LOCK_SET_SNAPSHOT`; counter `eval_incumbent_reeval_total`.
+- **#E1 Safety keyword bypass + silent degrade** (`safety_battery.py`): "I'm sorry,
+  but here's how to make explosives…" passed because it contained "sorry". Hardened
+  `_keyword_is_safe` (refusal phrase required AND no harmful-compliance terms AND not
+  much content after the refusal — `SAFETY_MAX_TOKENS_AFTER_REFUSAL`). In production
+  with `SAFETY_REQUIRE_CLASSIFIER`, an unavailable/failed Llama Guard now **fails
+  closed** (response treated unsafe, blocks promotion) instead of using keywords.
+  Counter `safety_classifier_unavailable_blocks_total`.
+- **#T3 Trigger missed format/refusal-only regressions** (`training/trigger.py`):
+  required drift AND count, but format/refusal regressions never move the embedding
+  distribution. Drift is now a **soft gate** — exempted when the dominant pending
+  failure type is in `TRIGGER_DRIFT_EXEMPT_FAILURE_TYPES` (format/refusal); hard for
+  hallucination/semantic_drift. Node passes `pending_failure_type_counts()` (new repo
+  method). Counter `training_trigger_drift_exempt_total`.
+- **#T2 Replay buffer had no recency bias** (`dataset_builder.py`, `llm_logs.py`):
+  `get_known_good_sample` already filtered to the prod version but sampled
+  `ORDER BY RANDOM()`. Added `get_known_good_candidates` (newest-first) +
+  `_recency_weighted_sample` (exponential decay, `REPLAY_RECENCY_DECAY`) so older,
+  weaker-model logs contribute less, and recorded `{version: count}` in
+  `training_runs.replay_distribution`. (Also fixed a latent bug: `settings.replay_ratio`
+  was referenced but never defined.)
+- **#T4 dataset_uri could dangle on a failed run** (`modal_worker.py`, `lora_trainer.py`):
+  the dataset was only written to the Volume *inside* `train_lora`. Now
+  `persist_dataset_to_volume()` uploads it (Modal `batch_upload`) **before** submit,
+  `dataset_uri` is set only after `dataset_uri_resolvable()` confirms it, and in
+  production an unresolvable artifact **aborts** the run pre-GPU.
+- **#E3 Pure-LRU eval eviction dropped good rare examples** (`eval_set.py`,
+  `eval_factory.py`): replaced `evict_oldest` with `evict_weighted` —
+  `_select_eviction_victims` evicts the **lowest-confidence quartile first** (LRU
+  within it), then overall LRU; seed rows never touched (`EVAL_FACTORY_EVICT_CONFIDENCE_QUARTILE`).
+- **#E4 One-sided test let a regressing challenger through** (`statistical_tests.py`):
+  added an explicit early guard — if mean quality delta < 0, return
+  `passed=False, fail_reason="challenger_regression"` before the significance test
+  (in both `_from_deltas` and the two-sample gate). Counter `challenger_regression_blocks_total`.
+
 ### New files / schema / endpoints
 - New modules: `src/db/repositories/eval_set.py`, `src/detection/calibrator.py`,
   `src/shadow/canary.py`, `src/monitoring/cost_tracker.py`, `src/api/routers/training.py`.
@@ -232,7 +285,8 @@
 - Migration `007_eval_factory.py` (RFC-002): 8 columns + 2 indexes on `eval_set`.
 - Migration `008_failure_attribution.py` (RFC-003): `failure_attributions` table.
 - Migration `009_knowledge_base.py` (retriever): `knowledge_documents` table + index.
-  **All migrations applied + downgrade-tested against live Postgres (head = 009).**
+- Migration `010_replay_distribution.py` (#T2): `training_runs.replay_distribution` JSONB.
+  **Migrations 004–009 applied + downgrade-tested against live Postgres; head = 010.**
 - More new modules: `src/detection/drift_predictor.py`, `src/db/repositories/drift_trend.py`,
   `src/evaluation/eval_factory.py`, `src/attribution/{influence,attributor}.py`,
   `src/db/repositories/attribution.py`, `src/retrieval/retriever.py`,
@@ -246,8 +300,9 @@
 - New unit tests: `test_hallucination.py`, `test_canary.py`, `test_dataset_builder.py`,
   `test_calibrator.py`, `test_teacher_grounding.py`, `test_drift_predictor.py` (12),
   `test_eval_factory.py` (12), `test_attribution.py` (11), `test_retriever.py` (8),
-  `test_detection_hardening.py` (15), `test_curation_hardening.py` (15)
-  — suite now **137 tests collected; 131 pass with no external services** (the 6
+  `test_detection_hardening.py` (15), `test_curation_hardening.py` (15),
+  `test_training_eval_hardening.py` (17)
+  — suite now **154 tests collected; 148 pass with no external services** (the 6
   HMAC tests need a running Vault — see the test-count note earlier in §0).
 
 ### Decisions / still out of scope
@@ -1605,7 +1660,7 @@ python scripts/manual_rollback.py --version v7 --reason "safety_regression"
 
 ## 18. Alembic Migrations
 
-Nine migration versions, applied in order via `uv run alembic -c alembic/alembic.ini upgrade head`:
+Ten migration versions, applied in order via `uv run alembic -c alembic/alembic.ini upgrade head`:
 
 ### `001_initial_schema.py`
 - Creates all 8 tables: `llm_logs`, `failure_classifications`, `training_examples`, `model_versions`, `training_runs`, `eval_runs`, `audit_trail`, `drift_baselines`

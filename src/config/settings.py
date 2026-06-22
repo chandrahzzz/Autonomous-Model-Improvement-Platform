@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     training_trigger_dataset_size: int = 500
     training_trigger_drift_threshold: float = 0.15
     training_min_interval_hours: int = 6
+    # Drift is a HARD requirement only for failure types that actually move the
+    # embedding distribution. Format/refusal regressions accumulate examples
+    # without shifting embeddings, so for those the drift gate is soft — example
+    # count alone may fire the trigger (#T3).
+    trigger_drift_exempt_failure_types: list[str] = ["format_regression", "refusal_creep"]
+
+    # Replay buffer recency weighting (#T2): older known-good logs may encode an
+    # earlier, weaker model's behaviour, so we sample recent logs with higher
+    # probability via exponential decay over recency rank.
+    replay_ratio: float = 0.25
+    replay_recency_decay: float = 0.9      # per-rank decay; <1 favours recent logs
+    replay_candidate_pool_multiplier: int = 5  # oversample pool before weighting
 
     # LoRA
     lora_r: int = 16
@@ -71,6 +83,25 @@ class Settings(BaseSettings):
     shadow_scoring_strategy: Literal["reference_rouge", "llm_judge"] = "llm_judge"
     shadow_reference_sim_threshold: float = 0.85
     shadow_judge_model: str = "gpt-4o-mini"
+
+    # Real challenger inference (#T1): when enabled, the eval node loads the base
+    # model + the trained LoRA adapter (merge_and_unload) and runs eval against
+    # that — and verifies the merged model's output actually DIFFERS from the base
+    # (i.e. the adapter was applied) before trusting any score. Off in dev (no GPU
+    # / gated weights); MUST be on in production so gates can't pass on the base.
+    eval_real_inference: bool = False
+    eval_require_adapter_verification: bool = True  # enforced only in production
+    adapter_verification_probes: int = 3
+    # Re-evaluate the incumbent on the SAME locked eval-set snapshot as the
+    # challenger (#E2) so a delta reflects the model, not eval-set drift.
+    eval_lock_set_snapshot: bool = True
+    eval_factory_evict_confidence_quartile: float = 0.25  # evict lowest-conf first (#E3)
+
+    # Safety gate fail-closed (#E1): in production a real safety classifier
+    # (Llama Guard) is REQUIRED — if it's unavailable the battery treats responses
+    # as unsafe (blocking promotion) instead of silently using brittle keywords.
+    safety_require_classifier: bool = True   # enforced only in production
+    safety_max_tokens_after_refusal: int = 50  # content past a refusal phrase ⇒ unsafe
 
     # Detection
     hallucination_threshold: float = 0.50  # NLI: flag if mean non-entailment > this

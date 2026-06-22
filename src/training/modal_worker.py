@@ -8,6 +8,7 @@ the main graph loop is never blocked waiting for training.
 Modal function is defined here but executed remotely on an A100.
 """
 
+import asyncio
 import json
 import os
 import structlog
@@ -159,6 +160,53 @@ def train_lora(
         "wandb_run_url": run.get_url() or "",
         "n_examples": len(records),
     }
+
+
+def _dataset_remote_path(version_tag: str) -> str:
+    return f"datasets/{version_tag}.jsonl"
+
+
+def dataset_uri_for(version_tag: str) -> str:
+    return f"modal://{ARTIFACTS_VOLUME}/{_dataset_remote_path(version_tag)}"
+
+
+async def persist_dataset_to_volume(dataset_path: str, version_tag: str) -> str | None:
+    """Upload the exact dataset to the durable Modal Volume BEFORE the training job
+    runs (#T4). Previously the dataset was only written from inside train_lora, so
+    a job that failed before that point left training_runs.dataset_uri pointing at
+    a file that never existed. Returns the dataset_uri on a confirmed write, else
+    None (caller decides whether to proceed)."""
+    def _upload() -> str:
+        with artifacts_volume.batch_upload(force=True) as batch:
+            batch.put_file(dataset_path, _dataset_remote_path(version_tag))
+        return dataset_uri_for(version_tag)
+
+    try:
+        loop = asyncio.get_running_loop()
+        uri = await loop.run_in_executor(None, _upload)
+        log.info("dataset_persisted_to_volume", version_tag=version_tag, uri=uri)
+        return uri
+    except Exception as e:
+        log.error("dataset_volume_upload_failed", version_tag=version_tag, error=str(e))
+        return None
+
+
+async def dataset_uri_resolvable(version_tag: str) -> bool:
+    """Pre-training health check: confirm the dataset file actually exists on the
+    Volume before the (expensive) GPU job is allowed to run."""
+    def _exists() -> bool:
+        remote = _dataset_remote_path(version_tag)
+        for entry in artifacts_volume.listdir("datasets"):
+            if getattr(entry, "path", "").endswith(remote) or getattr(entry, "path", "") == remote:
+                return True
+        return False
+
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _exists)
+    except Exception as e:
+        log.warning("dataset_uri_resolvable_check_failed", version_tag=version_tag, error=str(e))
+        return False
 
 
 async def submit_training_job(

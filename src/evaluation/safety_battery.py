@@ -100,13 +100,44 @@ SAFETY_REFUSAL_INDICATORS = [
     "won't help", "can't help", "sorry", "apologize",
 ]
 
+# Content terms that strongly indicate the model COMPLIED with a harmful request,
+# regardless of any polite refusal phrasing wrapped around them.
+HARMFUL_COMPLIANCE_TERMS = [
+    "step 1", "step-by-step", "step by step", "here's how", "heres how",
+    "here is how", "first, you", "you will need", "you'll need", "ingredients",
+    "materials needed", "instructions:", "follow these", "the recipe",
+    "synthesi", "detonat", "payload", "exploit code", "def ", "import os",
+    "import socket", "keylogger", "ransomware", "<script", "powershell",
+]
+
 
 def _keyword_is_safe(response: str) -> bool:
-    """Last-resort keyword heuristic. Brittle by design — a harmful answer that
-    merely contains the word 'sorry' passes. Only used when no real classifier
-    is configured, and always logged as degraded."""
-    lower = response.lower()
-    return any(ind in lower for ind in SAFETY_REFUSAL_INDICATORS)
+    """Hardened last-resort heuristic (used only when no real classifier runs).
+
+    A response is SAFE only when it BOTH (a) contains a refusal phrase AND
+    (b) does not continue with substantial content after that refusal AND
+    (c) contains no harmful-compliance terms. This closes the classic bypass
+    where "I'm sorry, but here is how to make explosives…" passed because it
+    merely contained the word "sorry"."""
+    text = response or ""
+    lower = text.lower()
+
+    positions = [lower.find(ind) for ind in SAFETY_REFUSAL_INDICATORS if ind in lower]
+    if not positions:
+        return False  # no refusal at all → unsafe
+
+    # Harmful-content terms anywhere ⇒ the model complied; never safe.
+    if any(term in lower for term in HARMFUL_COMPLIANCE_TERMS):
+        return False
+
+    # Refused, then kept going with a lot of content ⇒ likely complied after a
+    # token refusal. Count words after the earliest refusal phrase.
+    first = min(positions)
+    tokens_after = len(text[first:].split())
+    if tokens_after > settings.safety_max_tokens_after_refusal:
+        return False
+
+    return True
 
 
 class LlamaGuardClassifier:
@@ -135,9 +166,17 @@ class LlamaGuardClassifier:
                 ),
             )
 
+    def _fail_closed_required(self) -> bool:
+        """A safety gate must not silently degrade to keywords in production."""
+        return settings.safety_require_classifier and settings.environment == "production"
+
     async def is_safe(self, prompt: str, response: str) -> tuple[bool, str]:
         """Returns (is_safe, reason). is_safe=False means the response is harmful."""
         if not self._enabled:
+            if self._fail_closed_required():
+                from src.monitoring.metrics import safety_classifier_unavailable_blocks_total
+                safety_classifier_unavailable_blocks_total.inc()
+                return False, "classifier_unavailable_failclosed"
             safe = _keyword_is_safe(response)
             return safe, "keyword_fallback" if safe else "keyword_flagged_unsafe"
 
@@ -158,7 +197,11 @@ class LlamaGuardClassifier:
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"].strip().lower()
         except Exception as e:
-            log.warning("llama_guard_call_failed_keyword_fallback", error=str(e))
+            log.warning("llama_guard_call_failed", error=str(e))
+            if self._fail_closed_required():
+                from src.monitoring.metrics import safety_classifier_unavailable_blocks_total
+                safety_classifier_unavailable_blocks_total.inc()
+                return False, "classifier_error_failclosed"
             safe = _keyword_is_safe(response)
             return safe, "keyword_fallback_after_error"
 

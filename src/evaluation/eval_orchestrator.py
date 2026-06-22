@@ -37,10 +37,15 @@ class EvalOrchestrator:
         challenger_invoke_fn: Any,
         incumbent_scores: dict[str, float] | None,
         eval_set: list[dict],
+        incumbent_invoke_fn: Any = None,
     ) -> EvalResult:
         """
         Run full evaluation suite against challenger model.
-        incumbent_scores: previous production scores for delta comparison.
+
+        incumbent_scores: previous production scores (used only as a fallback).
+        incumbent_invoke_fn: when provided (#E2), the incumbent is RE-evaluated on
+            the SAME eval-set snapshot as the challenger, so the delta reflects the
+            model rather than how the live eval set has drifted between runs.
         """
         result = EvalResult(version_tag=version_tag, passed=False)
         fail_reasons: list[str] = []
@@ -69,12 +74,33 @@ class EvalOrchestrator:
         result.answer_relevancy = ragas_scores["answer_relevancy"]
         result.context_recall = ragas_scores["context_recall"]
 
-        # Stage 3: Improvement gate vs incumbent
-        if incumbent_scores:
+        # Stage 3: Improvement gate vs incumbent.
+        # Prefer re-scoring the incumbent on the SAME eval set (apples-to-apples,
+        # immune to eval-set drift); fall back to stored scores only if no
+        # incumbent invoke fn is available (dev).
+        effective_incumbent = incumbent_scores
+        if incumbent_invoke_fn is not None and settings.eval_lock_set_snapshot:
+            try:
+                from src.monitoring.metrics import eval_incumbent_reeval_total
+                log.info("eval_incumbent_reeval_starting", version=version_tag)
+                inc_scores = await self._ragas.run(incumbent_invoke_fn, eval_set)
+                effective_incumbent = inc_scores
+                eval_incumbent_reeval_total.inc()
+                result.rationale["incumbent_scores_on_snapshot"] = {
+                    k: round(v, 4) for k, v in inc_scores.items()
+                }
+                result.rationale["incumbent_source"] = "reevaluated_on_snapshot"
+            except Exception:
+                log.exception("incumbent_reeval_failed_falling_back_to_stored")
+                result.rationale["incumbent_source"] = "stored_fallback"
+        else:
+            result.rationale["incumbent_source"] = "stored"
+
+        if effective_incumbent:
             avg_incumbent = (
-                incumbent_scores.get("faithfulness", 0) +
-                incumbent_scores.get("answer_relevancy", 0) +
-                incumbent_scores.get("context_recall", 0)
+                effective_incumbent.get("faithfulness", 0) +
+                effective_incumbent.get("answer_relevancy", 0) +
+                effective_incumbent.get("context_recall", 0)
             ) / 3
 
             avg_challenger = (

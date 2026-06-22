@@ -172,7 +172,11 @@ class EvalFactory:
 
         counts = await self._eval_repo.count_active_by_source()
         if sum(counts.values()) >= settings.eval_factory_max_eval_set_size:
-            evicted = await self._eval_repo.evict_oldest(count=1)
+            # Confidence-weighted eviction: drop the lowest-confidence factory rows
+            # first (LRU within that quartile), not just least-recently-accessed (#E3).
+            evicted = await self._eval_repo.evict_weighted(
+                count=1, low_conf_quartile=settings.eval_factory_evict_confidence_quartile
+            )
             eval_factory_examples_evicted_total.inc(evicted)
 
         await self._eval_repo.insert_factory_example({
