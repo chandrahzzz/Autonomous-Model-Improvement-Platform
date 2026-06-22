@@ -207,6 +207,45 @@ class Settings(BaseSettings):
     canary_window_minutes: int = 60
     canary_min_requests: int = 50
     canary_max_error_rate: float = 0.01
+    # Real-time canary abort (#S2): if the running error rate spikes past
+    # canary_max_error_rate × this multiplier — once enough requests have been
+    # seen — abort immediately mid-window instead of waiting for it to close.
+    canary_abort_error_multiplier: float = 2.0
+    canary_min_requests_for_abort: int = 20
+
+    # Shadow sampling + retention
+    # Stratified temporal sampling (#S1): balance shadow samples across time
+    # buckets so a 48h A/B doesn't oversample peak hours.
+    shadow_stratified_sampling_enabled: bool = True
+    shadow_stratify_bucket_hours: int = 4
+    shadow_samples_bucket_key: str = "shadow:samples_by_bucket"
+    # shadow_logs retention (#S3): the table is append-only per shadow request;
+    # prune rows older than this so it doesn't grow unboundedly.
+    shadow_logs_retention_days: int = 30
+    shadow_logs_cleanup_interval_cycles: int = 100
+
+    # LangGraph checkpointer (#L1): "postgres" gives crash-resilient resume but
+    # needs the langgraph-checkpoint-postgres extra; falls back to in-memory with
+    # a loud warning if unavailable. Redis full_state remains the fast recovery path.
+    checkpointer_backend: Literal["memory", "postgres"] = "memory"
+
+    # Event-driven fast-path (#L3): when a cycle detects a large failure burst,
+    # skip the inter-cycle sleep and re-run immediately (bounded) so curation
+    # isn't delayed ~60s behind a severe regression.
+    high_severity_failure_threshold: int = 500
+    max_consecutive_fast_cycles: int = 5
+
+    # Kafka DLQ replay (#I1): periodically replay dead-lettered events back into
+    # the pipeline with bounded attempts instead of letting them rot.
+    dlq_replay_enabled: bool = True
+    dlq_replay_interval_cycles: int = 20
+    dlq_replay_max_per_cycle: int = 100
+    dlq_replay_max_attempts: int = 5
+
+    # Knowledge base size guard (#I3): warn (and surface) when the numpy-scan KB
+    # grows past the point where per-query latency starts to matter; the
+    # documented migration path is pgvector + IVFFlat.
+    knowledge_base_size_warn_threshold: int = 5000
 
     # Cost controls
     monthly_budget_usd: float = 500.0

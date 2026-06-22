@@ -272,6 +272,63 @@
   `passed=False, fail_reason="challenger_regression"` before the significance test
   (in both `_from_deltas` and the two-sample gate). Counter `challenger_regression_blocks_total`.
 
+### Shadow / state-machine / infra hardening (June 2026) — 12 gaps reviewed
+> Additive + kill-switched. Tests: `tests/test_shadow_state_infra_hardening.py` (12).
+> Migrations **011** (`pipeline_metrics`) + **012** (`tenant_id` scaffold). Head = 012.
+> New docs: `docs/DATA_RETENTION.md`, `docs/RETRIEVAL_SCALING.md`, `docs/MULTI_TENANCY.md`.
+- **#S1 Stratified shadow sampling** (`shadow/router.py`): stateless 10% sampling
+  oversamples peak hours. Added `_bucket_keep_multiplier` + `_stratified_admit` —
+  per-time-bucket counts in Redis down-sample over-represented buckets toward the
+  least-represented, so the A/B sample reflects the full daily distribution.
+  `SHADOW_STRATIFY_BUCKET_HOURS`; counter `shadow_sample_skipped_overrepresented_total`.
+- **#S2 Canary real-time auto-abort** (`shadow/canary.py`): `evaluate()` no longer
+  waits for the window to close — once `CANARY_MIN_REQUESTS_FOR_ABORT` requests
+  arrive, a safety failure or an error rate past `canary_max_error_rate ×
+  CANARY_ABORT_ERROR_MULTIPLIER` triggers immediate rollback + PagerDuty
+  (`_alert_auto_abort`). Counter `canary_auto_aborts_total`.
+- **#S3 shadow_logs retention** (`shadow/ab_collector.py`): `cleanup_old(days)`
+  prunes rows older than `SHADOW_LOGS_RETENTION_DAYS`, called by the runner every
+  `SHADOW_LOGS_CLEANUP_INTERVAL_CYCLES`. (The existing `(challenger_version,
+  created_at)` index already keeps `collect_window` fast — this is storage only.)
+- **#L1 Pluggable checkpointer** (`graph/graph.py`): `build_checkpointer()` selects
+  `CHECKPOINTER_BACKEND` — `postgres` (durable resume, needs the
+  `langgraph-checkpoint-postgres` extra) with a **loud MemorySaver fallback** when
+  the extra is absent. `compile_graph(checkpointer=None)` is now injectable.
+  NOTE: the postgres path needs the extra installed + a one-time `.setup()`; the
+  Redis `full_state` snapshot + conditional entry point already give practical
+  restart recovery, so memory is degraded-but-working, not broken.
+- **#L2 Error-state clearing** (`rollback_node.py`, `promote_model_node`, `runner.py`):
+  rollback/promote now reset `error/error_node` (and stale in-flight markers:
+  `modal_job_id`, `shadow_active`, `version_tag`, …); the runner also clears
+  `error/error_node` before every `ainvoke` so a prior cycle's failure can't
+  misroute the conditional entry point.
+- **#L3 Event-driven fast-path** (`runner.py`): `_should_fast_path()` skips the
+  inter-cycle sleep (bounded by `MAX_CONSECUTIVE_FAST_CYCLES`) when
+  `failure_count ≥ HIGH_SEVERITY_FAILURE_THRESHOLD` in monitoring phase, so a large
+  burst goes to curation immediately. Counter `pipeline_fast_path_cycles_total`.
+- **#L4 Lifetime cycle counter** (`runner.py`, migration 011): `cycles_completed`
+  is now a SESSION counter (reset on startup); the durable lifetime total lives in
+  the single-row `pipeline_metrics` table, incremented each cycle, gauged
+  (`lifetime_cycles_completed`) and surfaced in `/pipeline/status`.
+- **#I1 DLQ replayer** (`kafka/dlq_consumer.py`): `DLQReplayer.replay_batch()`
+  drains `pipeline.dlq`, replays to the original topic, and drops only after
+  `DLQ_REPLAY_MAX_ATTEMPTS` (tracked in the envelope). Runner calls it every
+  `DLQ_REPLAY_INTERVAL_CYCLES`. `dlq_depth` gauge + `dlq_replayed_total`/`dlq_replay_failed_total`.
+- **#I2 Partition claim was FALSE** — `llm_logs` is a plain (unpartitioned) table;
+  there's no quarter boundary that can break inserts (`grep -r PARTITION` → none).
+  Documented honestly in `docs/DATA_RETENTION.md` with the real retention options
+  (pg_partman or scheduled DELETE), kept off by default since llm_logs feeds
+  baselines/replay.
+- **#I3 KB size guard** (`api/routers/knowledge.py`): ingestion warns + counts
+  (`knowledge_base_size_warnings_total`) past `KNOWLEDGE_BASE_SIZE_WARN_THRESHOLD`;
+  pgvector + IVFFlat migration path in `docs/RETRIEVAL_SCALING.md` (numpy stays as fallback).
+- **#I4 tenant_id scaffold** (migration 012): nullable, unenforced `tenant_id` on 8
+  core tables so eventual multi-tenancy is additive; path in `docs/MULTI_TENANCY.md`.
+- **#I5 Grafana alerts-as-code** (`src/monitoring/grafana/alerts.yaml`): alert rules
+  for the previously-dark RFC + hardening metrics (predictive-drift ETA < 6h,
+  attribution domination, eval-factory failure rate, DLQ backlog, canary auto-abort,
+  safety-classifier-unavailable, stale baseline, challenger regression).
+
 ### New files / schema / endpoints
 - New modules: `src/db/repositories/eval_set.py`, `src/detection/calibrator.py`,
   `src/shadow/canary.py`, `src/monitoring/cost_tracker.py`, `src/api/routers/training.py`.
@@ -286,7 +343,9 @@
 - Migration `008_failure_attribution.py` (RFC-003): `failure_attributions` table.
 - Migration `009_knowledge_base.py` (retriever): `knowledge_documents` table + index.
 - Migration `010_replay_distribution.py` (#T2): `training_runs.replay_distribution` JSONB.
-  **Migrations 004–009 applied + downgrade-tested against live Postgres; head = 010.**
+- Migration `011_pipeline_metrics.py` (#L4): single-row `pipeline_metrics` (lifetime cycles).
+- Migration `012_tenant_scaffold.py` (#I4): nullable `tenant_id` on 8 core tables.
+  **Migrations 004–009 applied + downgrade-tested against live Postgres; head = 012.**
 - More new modules: `src/detection/drift_predictor.py`, `src/db/repositories/drift_trend.py`,
   `src/evaluation/eval_factory.py`, `src/attribution/{influence,attributor}.py`,
   `src/db/repositories/attribution.py`, `src/retrieval/retriever.py`,
@@ -301,8 +360,8 @@
   `test_calibrator.py`, `test_teacher_grounding.py`, `test_drift_predictor.py` (12),
   `test_eval_factory.py` (12), `test_attribution.py` (11), `test_retriever.py` (8),
   `test_detection_hardening.py` (15), `test_curation_hardening.py` (15),
-  `test_training_eval_hardening.py` (17)
-  — suite now **154 tests collected; 148 pass with no external services** (the 6
+  `test_training_eval_hardening.py` (17), `test_shadow_state_infra_hardening.py` (12)
+  — suite now **166 tests collected; 160 pass with no external services** (the 6
   HMAC tests need a running Vault — see the test-count note earlier in §0).
 
 ### Decisions / still out of scope
@@ -1660,7 +1719,7 @@ python scripts/manual_rollback.py --version v7 --reason "safety_regression"
 
 ## 18. Alembic Migrations
 
-Ten migration versions, applied in order via `uv run alembic -c alembic/alembic.ini upgrade head`:
+Twelve migration versions, applied in order via `uv run alembic -c alembic/alembic.ini upgrade head`:
 
 ### `001_initial_schema.py`
 - Creates all 8 tables: `llm_logs`, `failure_classifications`, `training_examples`, `model_versions`, `training_runs`, `eval_runs`, `audit_trail`, `drift_baselines`

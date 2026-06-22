@@ -264,6 +264,38 @@ shadow_quality_delta_histogram = Histogram(
     buckets=[-0.2, -0.1, -0.05, 0, 0.05, 0.1, 0.2],
 )
 
+# ── Shadow / canary / infra hardening (June 2026) ──────────────────────────────
+shadow_sample_skipped_overrepresented_total = Counter(
+    "shadow_sample_skipped_overrepresented_total",
+    "Shadow samples skipped because their time bucket was already over-represented",
+)
+canary_auto_aborts_total = Counter(
+    "canary_auto_aborts_total",
+    "Canary rollouts auto-aborted mid-window on an error-rate spike",
+)
+shadow_logs_pruned_total = Counter(
+    "shadow_logs_pruned_total", "Old shadow_logs rows deleted by retention cleanup",
+)
+pipeline_fast_path_cycles_total = Counter(
+    "pipeline_fast_path_cycles_total",
+    "Cycles that skipped the inter-cycle sleep due to a high-severity failure burst",
+)
+lifetime_cycles_completed = Gauge(
+    "lifetime_cycles_completed", "Total pipeline cycles completed across all restarts",
+)
+dlq_depth = Gauge("dlq_depth", "Approximate number of messages waiting in the Kafka DLQ")
+dlq_replayed_total = Counter("dlq_replayed_total", "DLQ messages successfully replayed")
+dlq_replay_failed_total = Counter(
+    "dlq_replay_failed_total", "DLQ messages that exhausted replay attempts (dropped)",
+)
+knowledge_base_size_warnings_total = Counter(
+    "knowledge_base_size_warnings_total",
+    "Times the knowledge base exceeded the size-warning threshold at ingestion",
+)
+checkpointer_backend_info = Gauge(
+    "checkpointer_backend_info", "Active LangGraph checkpointer (1=set)", ["backend"],
+)
+
 # ── Pipeline State ────────────────────────────────────────────────────────────
 pipeline_cycle_duration = Histogram(
     "pipeline_cycle_duration_seconds",

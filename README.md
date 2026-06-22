@@ -162,6 +162,13 @@ All configuration is in `.env`. Key variables:
 | `SAFETY_REQUIRE_CLASSIFIER` | true | Fail-closed in prod when Llama Guard is unavailable (no keyword fallback) |
 | `TRIGGER_DRIFT_EXEMPT_FAILURE_TYPES` | format_regression, refusal_creep | Failure types that can trigger training without crossing the drift threshold |
 | `REPLAY_RECENCY_DECAY` | 0.9 | Exponential decay favouring recent known-good logs in the replay buffer |
+| `SHADOW_STRATIFIED_SAMPLING_ENABLED` | true | Balance shadow samples across time buckets (avoid peak-hour bias) |
+| `CANARY_ABORT_ERROR_MULTIPLIER` | 2.0 | Mid-window canary auto-abort when error rate spikes past max × this |
+| `SHADOW_LOGS_RETENTION_DAYS` | 30 | Prune shadow_logs older than this |
+| `CHECKPOINTER_BACKEND` | memory | `postgres` for crash-resilient LangGraph resume (needs the extra) |
+| `HIGH_SEVERITY_FAILURE_THRESHOLD` | 500 | Failure burst size that triggers the no-sleep fast-path |
+| `DLQ_REPLAY_ENABLED` | true | Periodically replay dead-lettered Kafka events back into the pipeline |
+| `KNOWLEDGE_BASE_SIZE_WARN_THRESHOLD` | 5000 | Warn at ingestion when the numpy-scan KB gets large (pgvector path) |
 
 ### Detection-layer hardening (June 2026)
 Six production gaps in the failure-detection layer were closed (plus a real
@@ -208,6 +215,29 @@ Eight production gaps in the training/eval systems were closed. All additive and
   quartile first (LRU within), not pure LRU, so high-value rare examples survive.
 - **Regression guard** — a challenger with a negative mean quality delta is blocked
   immediately, before the one-sided significance test.
+
+### Shadow / state-machine / infra hardening (June 2026)
+Twelve gaps across shadow A/B, the LangGraph state machine, and infrastructure
+were reviewed and closed (two had inaccurate premises — corrected honestly):
+- **Stratified shadow sampling** balances samples across time buckets so a 48h A/B
+  reflects the full daily traffic distribution, not just peak hours.
+- **Canary auto-abort** rolls back mid-window the moment the error rate spikes
+  (no waiting for the window to close) and pages on-call.
+- **shadow_logs retention** prunes old rows on a schedule.
+- **Pluggable LangGraph checkpointer** (`CHECKPOINTER_BACKEND=postgres` for
+  crash-resilient resume, with a loud in-memory fallback).
+- **Error-state hygiene** — rollback/promote and a per-cycle sanitizer clear stale
+  `error`/in-flight markers so they can't misroute the next cycle.
+- **Event-driven fast-path** skips the inter-cycle sleep during a high-severity
+  failure burst so curation isn't delayed.
+- **Durable lifetime cycle counter** in Postgres (session counter resets on restart).
+- **Kafka DLQ replayer** drains the dead-letter queue back into the pipeline with
+  a `dlq_depth` gauge instead of silently losing events.
+- **KB size guard** warns past a threshold with a documented pgvector/IVFFlat path
+  ([docs/RETRIEVAL_SCALING.md](docs/RETRIEVAL_SCALING.md)).
+- **tenant_id scaffold** + Grafana alerts-as-code ([src/monitoring/grafana/alerts.yaml](src/monitoring/grafana/alerts.yaml))
+  for the previously-dark RFC metrics. See [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md)
+  and [docs/MULTI_TENANCY.md](docs/MULTI_TENANCY.md).
 
 ---
 
@@ -319,7 +349,7 @@ make test-integration
 make test-cov
 ```
 
-**Suite status:** 154 tests collected. 148 pass locally with no external services.
+**Suite status:** 166 tests collected. 160 pass locally with no external services.
 The 6 `tests/integration/test_audit_integrity.py` + `test_pipeline_cycle.py` HMAC
 tests require a running Vault — they **fail loudly by design** when
 `VAULT_REQUIRED=true` and Vault is unreachable (this is the fail-closed audit

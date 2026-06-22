@@ -40,6 +40,17 @@ class ABCollector:
             },
         )
 
+    async def cleanup_old(self, retention_days: int) -> int:
+        """Delete shadow_logs rows older than retention_days (#S3). The table is
+        append-only per shadow request; without this it grows unboundedly. The
+        existing (challenger_version, created_at) index keeps collect_window fast,
+        so this is purely about storage. Returns rows deleted."""
+        result = await self._db.execute(
+            text("DELETE FROM shadow_logs WHERE created_at < NOW() - make_interval(days => :days)"),
+            {"days": retention_days},
+        )
+        return result.rowcount or 0
+
     async def collect_window(self, challenger_version: str) -> dict:
         """
         Collect all shadow log deltas for a challenger version.

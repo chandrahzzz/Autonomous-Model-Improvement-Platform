@@ -51,10 +51,22 @@ CYCLE_INTERVALS = {
 FULL_STATE_KEY = "pipeline:full_state"
 
 
+def _should_fast_path(failure_count: int, phase: str, consecutive: int) -> bool:
+    """Skip the inter-cycle sleep when a high-severity failure burst was just
+    detected, so curation isn't delayed ~60s behind a severe regression (#L3).
+    Bounded by max_consecutive_fast_cycles to avoid a hot loop."""
+    return (
+        phase == "monitoring"
+        and failure_count >= settings.high_severity_failure_threshold
+        and consecutive < settings.max_consecutive_fast_cycles
+    )
+
+
 class PipelineRunner:
     def __init__(self) -> None:
         self._graph = compile_graph()
         self._running = False
+        self._consecutive_fast_cycles = 0
         self._state: dict = {
             "cycles_completed": 0,
             "paused": False,
@@ -186,6 +198,10 @@ class PipelineRunner:
         log.info("pipeline_runner_starting", environment=settings.environment)
         await self._rehydrate_state()
         await self._rehydrate_detectors()
+        # cycles_completed is a SESSION counter (it grows via operator.add and the
+        # Redis snapshot has a 5-min TTL, so it's unreliable as a lifetime total).
+        # Reset it per session; the durable lifetime total lives in Postgres (#L4).
+        self._state["cycles_completed"] = 0
 
         # Register graceful shutdown handlers
         loop = asyncio.get_running_loop()
@@ -204,9 +220,22 @@ class PipelineRunner:
             pipeline_cycle_duration.observe(elapsed)
 
             if self._running:
-                interval = CYCLE_INTERVALS.get(self._current_phase(), CYCLE_SLEEP_SECONDS)
+                phase = self._current_phase()
+                failure_count = int(self._state.get("failure_count", 0) or 0)
+                if _should_fast_path(failure_count, phase, self._consecutive_fast_cycles):
+                    self._consecutive_fast_cycles += 1
+                    from src.monitoring.metrics import pipeline_fast_path_cycles_total
+                    pipeline_fast_path_cycles_total.inc()
+                    log.warning(
+                        "pipeline_fast_path_engaged",
+                        failure_count=failure_count,
+                        consecutive=self._consecutive_fast_cycles,
+                    )
+                    continue  # skip the sleep — re-run immediately
+                self._consecutive_fast_cycles = 0
+                interval = CYCLE_INTERVALS.get(phase, CYCLE_SLEEP_SECONDS)
                 sleep_for = max(0, interval - elapsed)
-                log.debug("pipeline_cycle_sleeping", seconds=sleep_for, phase=self._current_phase())
+                log.debug("pipeline_cycle_sleeping", seconds=sleep_for, phase=phase)
                 await asyncio.sleep(sleep_for)
 
         log.info("pipeline_runner_stopped")
@@ -249,6 +278,11 @@ class PipelineRunner:
             self._state["paused"] = False
             self._state["paused_reason"] = None
 
+        # Clear transient error markers before invoking so a previous cycle's
+        # failure can't leak into routing/eval this cycle (#L2).
+        self._state["error"] = None
+        self._state["error_node"] = None
+
         result = await self._graph.ainvoke(
             self._state,
             config={"configurable": {"thread_id": THREAD_ID}},
@@ -265,6 +299,9 @@ class PipelineRunner:
         await self._persist_detectors()
         await self._maybe_refresh_baselines()
         await self._maybe_calibrate()
+        await self._increment_lifetime_cycles()
+        await self._maybe_cleanup_shadow_logs()
+        await self._maybe_replay_dlq()
 
     async def _maybe_calibrate(self) -> None:
         """Periodically suggest detection-threshold adjustments from observed data."""
@@ -280,10 +317,68 @@ class PipelineRunner:
         except Exception:
             log.warning("threshold_calibration_failed")
 
+    async def _increment_lifetime_cycles(self) -> None:
+        """Bump the durable lifetime cycle counter in Postgres and the gauge (#L4).
+        The in-state `cycles_completed` is session-scoped (reset on startup); this
+        is the reliable lifetime total reported by /pipeline/status."""
+        try:
+            from sqlalchemy import text
+            from src.db.connection import get_db
+            from src.monitoring.metrics import lifetime_cycles_completed
+            async with get_db() as db:
+                row = await db.execute(text(
+                    "UPDATE pipeline_metrics SET lifetime_cycles_completed = "
+                    "lifetime_cycles_completed + 1, updated_at = NOW() WHERE id = 1 "
+                    "RETURNING lifetime_cycles_completed"
+                ))
+                total = row.scalar()
+            if total is not None:
+                lifetime_cycles_completed.set(int(total))
+                self._state["lifetime_cycles_completed"] = int(total)
+        except Exception:
+            log.warning("lifetime_cycle_increment_failed")
+
+    async def _maybe_cleanup_shadow_logs(self) -> None:
+        """Prune shadow_logs past the retention window so it doesn't grow forever (#S3)."""
+        interval = settings.shadow_logs_cleanup_interval_cycles
+        cycle = self._state.get("cycles_completed", 0)
+        if interval <= 0 or cycle == 0 or cycle % interval != 0:
+            return
+        try:
+            from src.db.connection import get_db
+            from src.shadow.ab_collector import ABCollector
+            from src.monitoring.metrics import shadow_logs_pruned_total
+            async with get_db() as db:
+                deleted = await ABCollector(db).cleanup_old(settings.shadow_logs_retention_days)
+            if deleted:
+                shadow_logs_pruned_total.inc(deleted)
+                log.info("shadow_logs_pruned", deleted=deleted)
+        except Exception:
+            log.warning("shadow_logs_cleanup_failed")
+
+    async def _maybe_replay_dlq(self) -> None:
+        """Periodically replay dead-lettered events back into the pipeline (#I1)."""
+        if not settings.dlq_replay_enabled:
+            return
+        interval = settings.dlq_replay_interval_cycles
+        cycle = self._state.get("cycles_completed", 0)
+        if interval <= 0 or cycle == 0 or cycle % interval != 0:
+            return
+        try:
+            from src.kafka.dlq_consumer import DLQReplayer
+            replayed, dropped = await DLQReplayer().replay_batch(
+                max_messages=settings.dlq_replay_max_per_cycle
+            )
+            if replayed or dropped:
+                log.info("dlq_replay_cycle", replayed=replayed, dropped=dropped)
+        except Exception:
+            log.warning("dlq_replay_failed")
+
     async def _publish_state(self) -> None:
         """Write a summary of the current pipeline state to Redis for the API to read."""
         summary = {
             "cycles_completed": self._state.get("cycles_completed", 0),
+            "lifetime_cycles_completed": self._state.get("lifetime_cycles_completed"),
             "production_version": self._state.get("production_version"),
             "pipeline_phase": self._current_phase(),
             "last_cycle_at": self._state.get("last_cycle_at"),

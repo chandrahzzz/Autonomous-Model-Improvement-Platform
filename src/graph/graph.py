@@ -79,7 +79,15 @@ async def promote_model_node(state: PipelineState) -> PipelineState:
         "production_version": version_tag,
         "training_triggered": False,
         "modal_job_id": None,
+        "training_status": "idle",
         "shadow_active": False,
+        "shadow_ready_for_decision": False,
+        "canary_active": False,
+        "version_tag": None,
+        "rollback_reason": None,
+        # Clear transient error markers so they don't leak into the next cycle (#L2).
+        "error": None,
+        "error_node": None,
         "cycles_completed": 1,
     }
 
@@ -294,8 +302,47 @@ def build_graph() -> StateGraph:
     return builder
 
 
-def compile_graph():
-    """Compile graph with in-memory checkpointer (swap for PostgreSQL in prod)."""
+def build_checkpointer():
+    """Return the configured LangGraph checkpointer (#L1).
+
+    `CHECKPOINTER_BACKEND=postgres` gives crash-resilient resume (the checkpoint
+    that records which node to resume from survives a restart), but requires the
+    `langgraph-checkpoint-postgres` extra and a one-time `.setup()`. When it's
+    unavailable we fall back to MemorySaver and warn loudly — the Redis
+    `pipeline:full_state` snapshot + conditional entry point still recover
+    in-flight Modal jobs / shadow windows, so this is degraded, not broken.
+    """
+    from src.config.settings import settings
+    from src.monitoring.metrics import checkpointer_backend_info
+
+    if settings.checkpointer_backend == "postgres":
+        try:
+            from langgraph.checkpoint.postgres import PostgresSaver  # type: ignore
+            conn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
+            saver_cm = PostgresSaver.from_conn_string(conn)
+            saver = saver_cm.__enter__()  # lifetime tied to the process
+            try:
+                saver.setup()  # idempotent: creates checkpoint tables if absent
+            except Exception:
+                log.warning("postgres_checkpointer_setup_skipped")
+            checkpointer_backend_info.labels(backend="postgres").set(1)
+            log.info("checkpointer_backend_selected", backend="postgres")
+            return saver
+        except Exception as e:
+            log.error(
+                "postgres_checkpointer_unavailable_falling_back_to_memory",
+                error=str(e),
+                hint="pip install langgraph-checkpoint-postgres to enable durable checkpoints",
+            )
+
+    checkpointer_backend_info.labels(backend="memory").set(1)
+    return MemorySaver()
+
+
+def compile_graph(checkpointer=None):
+    """Compile the graph. Pass a checkpointer to inject one (tests/custom); by
+    default the backend is chosen from settings (#L1)."""
     builder = build_graph()
-    checkpointer = MemorySaver()
+    if checkpointer is None:
+        checkpointer = build_checkpointer()
     return builder.compile(checkpointer=checkpointer)

@@ -19,4 +19,19 @@ async def rollback_node(state: PipelineState) -> PipelineState:
 
     rollbacks_total.labels(reason=reason).inc()
     log.warning("rollback_node_complete", rolled_back=version_tag, restored=prod_tag, reason=reason)
-    return {**state, "production_version": prod_tag, "training_triggered": False}
+    # Clear transient error + in-flight markers so the NEXT cycle starts clean and
+    # the conditional entry point can't misroute on stale state (#L2).
+    return {
+        **state,
+        "production_version": prod_tag,
+        "training_triggered": False,
+        "modal_job_id": None,
+        "training_status": "idle",
+        "shadow_active": False,
+        "shadow_ready_for_decision": False,
+        "canary_active": False,
+        "version_tag": None,
+        "rollback_reason": None,
+        "error": None,
+        "error_node": None,
+    }

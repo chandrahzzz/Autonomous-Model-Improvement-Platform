@@ -96,6 +96,26 @@ class CanaryController:
             "safety_failures": safety_failures, "elapsed_min": round(elapsed_min, 1),
         }
 
+        # Real-time abort (#S2): don't wait for the window to close — if a safety
+        # failure occurs, or the error rate spikes past the abort threshold once
+        # enough requests have arrived, roll back immediately and page on-call.
+        if requests >= settings.canary_min_requests_for_abort:
+            error_rate = errors / requests
+            abort_threshold = (
+                settings.canary_max_error_rate * settings.canary_abort_error_multiplier
+            )
+            if safety_failures > 0 or error_rate > abort_threshold:
+                from src.monitoring.metrics import canary_auto_aborts_total
+                metrics["error_rate"] = round(error_rate, 4)
+                metrics["reason"] = (
+                    "safety_failure_during_canary" if safety_failures > 0
+                    else f"error_rate_spike {error_rate:.4f} > {abort_threshold:.4f}"
+                )
+                canary_auto_aborts_total.inc()
+                await self._alert_auto_abort(active.get("version"), metrics)
+                log.error("canary_auto_abort", version=active.get("version"), **metrics)
+                return "rollback", metrics
+
         if elapsed_min < settings.canary_window_minutes:
             return "pending", metrics
 
@@ -116,6 +136,17 @@ class CanaryController:
             metrics["reason"] = f"error_rate {error_rate:.4f} > {settings.canary_max_error_rate}"
             return "rollback", metrics
         return "promote", metrics
+
+    async def _alert_auto_abort(self, version: str | None, metrics: dict) -> None:
+        try:
+            from src.monitoring.alerts import alerter
+            await alerter.trigger(
+                summary=f"Canary {version} auto-aborted: {metrics.get('reason')}",
+                severity="critical",
+                details=metrics,
+            )
+        except Exception:
+            log.warning("canary_auto_abort_alert_failed")
 
     async def clear(self) -> None:
         r = await self._r()

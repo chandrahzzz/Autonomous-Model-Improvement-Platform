@@ -1,0 +1,73 @@
+# Grafana / Prometheus alert rules (alerts-as-code) — #I5
+#
+# The RFC metrics (drift predictor, eval factory, failure attribution) and the
+# June-2026 hardening metrics were "dark": computed but never alerted on. These
+# rules wire them to PagerDuty. Apply via your Grafana provisioning or import
+# into Prometheus Alertmanager. Severity maps: warning -> PD low, critical -> PD high.
+
+groups:
+  - name: continuous-finetuning-rfc
+    rules:
+      - alert: PredictiveDriftImminent
+        expr: drift_predicted_trigger_hours >= 0 and drift_predicted_trigger_hours < 6
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Drift predicted to cross threshold in < 6h"
+          description: "drift_predicted_trigger_hours={{ $value }} — review before it triggers a retrain."
+
+      - alert: EvalFactoryHighFailureRate
+        # >50% of factory candidates skipped over the last hour.
+        expr: |
+          (sum(rate(eval_factory_examples_skipped_total[1h])))
+          / clamp_min(sum(rate(eval_factory_examples_skipped_total[1h])) + rate(eval_factory_examples_added_total[1h]), 1)
+          > 0.5
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Eval factory failure rate > 50%"
+
+      - alert: AttributionSingleExampleDominates
+        # One training example blamed in a large share of recent failures → retraction review.
+        expr: max(attribution_influential) > 0.3
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "A single training example is blamed in >30% of recent failures"
+
+  - name: continuous-finetuning-hardening
+    rules:
+      - alert: KafkaDLQBacklog
+        expr: dlq_depth > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Kafka DLQ has unprocessed messages for >15m (dropped LLM events)"
+
+      - alert: CanaryAutoAborted
+        expr: increase(canary_auto_aborts_total[10m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "A canary rollout auto-aborted on an error-rate spike"
+
+      - alert: SafetyClassifierUnavailable
+        expr: increase(safety_classifier_unavailable_blocks_total[15m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "Safety classifier unavailable in production — battery failing closed"
+
+      - alert: DriftBaselineStale
+        expr: drift_baseline_age_hours > 24
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Drift baseline older than 24h — detection may be unreliable"
+
+      - alert: ChallengerRegressionBlocked
+        expr: increase(challenger_regression_blocks_total[1h]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "A challenger with a negative quality delta reached the gate (blocked)"

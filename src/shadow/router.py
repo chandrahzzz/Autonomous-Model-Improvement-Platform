@@ -4,18 +4,38 @@ model for silent scoring. Challenger output is NEVER served to users.
 """
 
 import random
+import time
 import asyncio
 import structlog
 
 import redis.asyncio as aioredis
 
 from src.config.settings import settings
-from src.monitoring.metrics import shadow_requests_total, shadow_quality_delta_histogram
+from src.monitoring.metrics import (
+    shadow_requests_total,
+    shadow_quality_delta_histogram,
+    shadow_sample_skipped_overrepresented_total,
+)
 
 log = structlog.get_logger()
 
 SHADOW_ACTIVE_KEY = "shadow:active_version"
 SHADOW_ABORT_KEY = "shadow:abort"
+
+
+def _bucket_keep_multiplier(bucket_counts: dict[str, int], current_bucket: str) -> float:
+    """Stratified-sampling correction (#S1). Given how many shadow samples each
+    time bucket already holds, return a [0,1] multiplier on the base sampling rate
+    for the current bucket so that over-represented (peak-hour) buckets are
+    down-sampled toward the least-represented bucket. Pure + deterministic."""
+    if not bucket_counts:
+        return 1.0
+    cur = bucket_counts.get(current_bucket, 0)
+    min_count = min([*bucket_counts.values(), cur])
+    if cur <= min_count:
+        return 1.0
+    # Accept the current bucket at a rate that pulls it back toward the minimum.
+    return max(0.1, (min_count + 1) / (cur + 1))
 
 
 class ShadowRouter:
@@ -58,6 +78,12 @@ class ShadowRouter:
         if random.random() > settings.ab_shadow_traffic_pct:
             return None
 
+        # Stratified temporal sampling: keep buckets balanced so the A/B sample
+        # reflects the full daily traffic distribution, not just peak hours (#S1).
+        if settings.shadow_stratified_sampling_enabled and not await self._stratified_admit():
+            shadow_sample_skipped_overrepresented_total.inc()
+            return None
+
         try:
             challenger_output = await challenger_invoke_fn(prompt)
             quality_delta = await self._score_delta(
@@ -81,6 +107,31 @@ class ShadowRouter:
         except Exception:
             log.exception("shadow_routing_failed")
             return None
+
+    def _current_bucket(self) -> str:
+        bucket_secs = max(1, settings.shadow_stratify_bucket_hours) * 3600
+        return str(int(time.time() // bucket_secs))
+
+    async def _stratified_admit(self) -> bool:
+        """Decide whether to keep this sample given bucket balance, and record it
+        if kept. Fails open (admits) on any Redis error so shadowing never stalls."""
+        try:
+            bucket = self._current_bucket()
+            raw = await self._redis.hgetall(settings.shadow_samples_bucket_key)
+            counts = {k: int(v) for k, v in raw.items()} if raw else {}
+            multiplier = _bucket_keep_multiplier(counts, bucket)
+            if random.random() >= multiplier:
+                return False
+            await self._redis.hincrby(settings.shadow_samples_bucket_key, bucket, 1)
+            # Expire the whole map a few buckets out so old tests don't skew new ones.
+            await self._redis.expire(
+                settings.shadow_samples_bucket_key,
+                settings.shadow_stratify_bucket_hours * 3600 * 12,
+            )
+            return True
+        except Exception:
+            log.warning("shadow_stratified_admit_failed_open")
+            return True
 
     async def _score_delta(
         self, prompt: str, production: str, challenger: str
