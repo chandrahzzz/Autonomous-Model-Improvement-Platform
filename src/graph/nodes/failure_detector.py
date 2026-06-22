@@ -104,14 +104,17 @@ async def failure_detector_node(state: PipelineState) -> PipelineState:
             if record:
                 # Prefer the first-class column; fall back to metadata for
                 # producers that haven't migrated yet.
-                ctx = getattr(record, "retrieved_context", None)
-                if not ctx and isinstance(getattr(record, "metadata_", None), dict):
-                    ctx = record.metadata_.get("retrieved_context")
+                meta = getattr(record, "metadata_", None)
+                meta = meta if isinstance(meta, dict) else {}
+                ctx = getattr(record, "retrieved_context", None) or meta.get("retrieved_context")
+                # A call is RAG if it carried context or was explicitly flagged.
+                is_rag = bool(meta.get("is_rag")) or bool(ctx)
                 events.append({
                     "id": str(record.id),
                     "prompt": record.prompt,
                     "completion": record.completion,
                     "retrieved_context": ctx or "",
+                    "is_rag": is_rag,
                     "model_version": record.model_version,
                 })
 

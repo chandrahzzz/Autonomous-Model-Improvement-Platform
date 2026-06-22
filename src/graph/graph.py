@@ -52,19 +52,27 @@ async def promote_model_node(state: PipelineState) -> PipelineState:
     promotions_total.inc()
     log.info("model_promoted", version_tag=version_tag)
 
-    # Refresh the drift baseline against the newly promoted model so drift is no
-    # longer measured against a stale seed. Failure here must NOT undo the
-    # promotion — log loudly and continue with the old baseline.
+    # Refresh the drift AND format baselines against the newly promoted model so
+    # neither is measured against a stale seed. Failure here must NOT undo the
+    # promotion — log loudly and continue with the old baselines.
     try:
-        from src.graph.nodes.failure_detector import _drift
+        from src.graph.nodes.failure_detector import _drift, _fmt
         from src.config.settings import settings as _settings
+        from src.db.repositories.llm_logs import LLMLogRepository
         async with get_db() as db:
             await _drift.refresh_baseline(
                 db, model_version=version_tag,
                 min_samples=_settings.drift_baseline_min_samples,
             )
+            # Format length baseline (#5): recompute from the new model's outputs.
+            completions = await LLMLogRepository(db).get_recent_completions(
+                limit=10000, model_version=version_tag
+            )
+            if len(completions) < _settings.format_min_samples:
+                completions = await LLMLogRepository(db).get_recent_completions(limit=10000)
+            _fmt.refresh_baseline(completions)
     except Exception:
-        log.error("drift_baseline_refresh_failed", version_tag=version_tag)
+        log.error("baseline_refresh_failed", version_tag=version_tag)
 
     return {
         **state,

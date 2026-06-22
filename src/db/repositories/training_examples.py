@@ -29,6 +29,17 @@ class TrainingExampleRepository:
         )
         return result.scalar_one()
 
+    async def all_for_dedup(self, limit: int = 50000) -> list[tuple[str, str]]:
+        """(prompt, corrected_completion) for every stored example — used to
+        rehydrate the in-memory MinHash near-dup index on startup. Newest first
+        so the cap keeps the most recent examples."""
+        result = await self._db.execute(
+            select(TrainingExample.prompt, TrainingExample.corrected_completion)
+            .order_by(TrainingExample.created_at.desc())
+            .limit(limit)
+        )
+        return [(r[0], r[1]) for r in result.fetchall()]
+
     async def get_pending(self, limit: int = 2000) -> list[TrainingExample]:
         result = await self._db.execute(
             select(TrainingExample)

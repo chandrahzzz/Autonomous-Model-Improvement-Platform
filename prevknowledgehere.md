@@ -131,6 +131,94 @@
   Off via `RETRIEVAL_ENABLED`. This makes the answer to "is RAG implemented here?"
   finally **yes** (numpy-cosine vector store + retrieve→augment→ground for the teacher).
 
+### Detection-layer hardening (June 2026) — closes 6 production gaps + 1 real bug
+> All additive and kill-switched. Settings live in the **"Detection hardening"**
+> block of `settings.py`. Tests: `tests/test_detection_hardening.py` (15).
+- **#1 Hallucination premise grounding is now observable** (`failure_classifier.py`):
+  the NLI premise still prefers `retrieved_context` and falls back to the prompt,
+  but every hallucination `FailureEvent` now carries `metadata.premise_source`
+  (`context` | `prompt` | `prompt_fallback`) + `grounded: bool`. A call flagged
+  `is_rag=True` (new field on `LLMEvent`; read from `llm_logs.metadata.is_rag` or
+  inferred from non-empty context) but **missing** its context is counted in
+  `hallucination_premise_missing_total` and marked `prompt_fallback`/ungrounded
+  rather than silently graded against the bare prompt. Surfaced on `/health`.
+- **#2 Drift baseline ages out independently of promotions** (`drift.py` + `runner.py`):
+  previously refreshed ONLY after a promotion, so a 48h shadow window / rollback
+  storm let it grow stale → false drift. `DriftDetector` now tracks
+  `baseline_age_hours`/`is_baseline_stale()` (via `computed_at`, newly returned by
+  `ModelRepository.get_active_baseline`); the runner's `_maybe_refresh_baselines()`
+  (every `BASELINE_REFRESH_CHECK_INTERVAL_CYCLES`) refreshes any baseline older
+  than `DRIFT_BASELINE_MAX_AGE_HOURS`. Gauge `drift_baseline_age_hours`.
+- **#3 Aggregate signals refuse to fire on too-few samples** (`drift.py`,`refusal.py`):
+  `is_drifting()` requires `≥ DRIFT_MIN_WINDOW` (50) samples; `is_creeping()`
+  requires `≥ REFUSAL_MIN_SAMPLES` (50); format already guarded `< FORMAT_MIN_SAMPLES`
+  (100). Below threshold they return False and bump `detector_insufficient_data_total`
+  instead of emitting a noisy false-positive on quiet traffic.
+- **#4 Rolling-window state survives restarts** (`drift/refusal/format` + `runner.py`):
+  each detector gains `save_window_state(redis)`/`load_window_state(redis)`; the
+  runner rehydrates them on startup (`_rehydrate_detectors`) and persists every
+  cycle (`_persist_detectors`). Stops a deploy resetting refusal rate / drift
+  trend to a misleading 0. Keyed by `DETECTOR_STATE_REDIS_PREFIX`; off via
+  `DETECTOR_STATE_PERSIST_ENABLED`. NOTE: the claim that exemplars are re-encoded
+  per batch was **wrong** — they're init-time on a module singleton; only the
+  window needed persistence.
+- **#5 Format length baseline refreshes** (`format_validator.py`): added
+  `refresh_baseline(completions)` + `baseline_age_hours`/`is_baseline_stale()`,
+  called from `promote_model_node` (alongside drift) and the runner's age check.
+  Stops KL firing forever after an intentional product-wide length change. Gauge
+  `format_baseline_age_hours`.
+- **#6 Correlated failures collapse to one event** (`failure_classifier.py`):
+  when multiple detectors fire on the same `llm_log_id`, `_collapse()` keeps the
+  highest-severity type (priority hallucination > drift > refusal > format,
+  tie-broken by score) and records `metadata.all_failure_types` + `is_correlated`,
+  so the curator makes ONE correction instead of near-duplicates. Counter
+  `correlated_failures_collapsed_total`. Off via `CORRELATE_FAILURES_ENABLED`.
+- **Real bug fixed (not in the review): drift was double-scored.** `classify_batch`
+  called `_drift.score()` once per event AND again inside the `is_drifting()`
+  loop, double-counting every completion into the rolling window and double-running
+  the encoder. Now scored exactly once per event and reused (regression-tested).
+
+### Curation-layer hardening (June 2026) — closes 5 production gaps
+> All additive and kill-switched. Settings in the **"Curation"** block of
+> `settings.py`. Tests: `tests/test_curation_hardening.py` (15).
+- **#1 Teacher self-consistency is now SEMANTIC** (`teacher.py`): the 3-vote
+  confidence used pairwise **ROUGE-L** (surface n-gram overlap) — so paraphrases
+  of the same answer scored low and were wrongly dropped, while three identically-
+  phrased *wrong* answers scored high and passed. Replaced with **mean pairwise
+  MiniLM cosine** (`_mean_pairwise_cosine`, shared `_shared_encoder()` lru_cache);
+  ROUGE-L is now only the fallback when embedding fails. `_pick_best` likewise
+  picks the centroid-nearest vote. New threshold `TEACHER_SEMANTIC_CONSISTENCY_THRESHOLD`
+  (0.80, lower than ROUGE's 0.85 because cosine runs lower for paraphrases).
+- **#2 PII is scrubbed BEFORE the teacher API call** (`curator.py`): the order was
+  cluster → GPT-4o → Presidio, so the raw prompt **and** raw bad completion (both
+  sent to OpenAI) leaked PII to a third party — and `bad_completion` was even
+  stored raw in the DB. Now Presidio scrubs prompt+completion **first** (fail-closed
+  drop *before* any API call → `examples_dropped_pre_scrub_total`); the teacher only
+  ever sees scrubbed text (`dataclasses.replace`); the teacher's output is scrubbed
+  again (defence-in-depth, since grounding context may carry PII); the stored
+  `bad_completion` is the scrubbed version. Counter `examples_pre_scrubbed_total`.
+- **#3 OpenAI rate-limit resilience** (`teacher._single_correction`): a 429 / timeout
+  previously hit the bare `except` and silently dropped the example. Now retried with
+  **exponential backoff + jitter** (`TEACHER_MAX_RETRIES`=5, base/max delay settings),
+  retrying `RateLimitError`/`APITimeoutError`/`APIConnectionError`/`InternalServerError`
+  (tenacity isn't a dep — manual loop). `teacher_rate_limit_retries_total` counts
+  retries; `teacher_dropped_rate_limited_total` counts examples dropped after
+  exhausting retries (distinct from quality drops). Non-retryable errors still
+  return None immediately.
+- **#4 Clustering scales to small batches** (`clustering.py`): HDBSCAN's fixed
+  `min_cluster_size=5` noise-labelled **every** failure when a batch had < 5 (common
+  early in a deployment). Now `min_cluster_size = min(5, max(2, n//3))` and, when
+  HDBSCAN still finds no structure (all noise) or n<2, it bypasses cleanly and counts
+  `clustering_bypassed_total`. NOTE: the review's "proportional sampling over-
+  representation" impact **doesn't exist** — the curator has no sampling step
+  (it processes all failures); the real benefit is honest cluster metadata.
+- **#5 Dedup index survives restarts** (`deduplicator.py` + `curator.py`): the MinHash
+  LSH near-dup index was in-memory only, so after a restart 85%-Jaccard near-dupes
+  (which the DB's exact-hash unique index can't catch) re-entered the training set.
+  `Deduplicator.preload(pairs)` rehydrates it; the curator calls `_rehydrate_dedup(db)`
+  once on the first cycle from `TrainingExampleRepository.all_for_dedup()` (newest
+  `DEDUP_REHYDRATE_LIMIT`=50k). Gauge `dedup_index_size`. Off via `DEDUP_REHYDRATE_ENABLED`.
+
 ### New files / schema / endpoints
 - New modules: `src/db/repositories/eval_set.py`, `src/detection/calibrator.py`,
   `src/shadow/canary.py`, `src/monitoring/cost_tracker.py`, `src/api/routers/training.py`.
@@ -157,8 +245,10 @@
   `/drift/trend*`, `/eval/set/*`, `/attribution/*`, `/knowledge/*`.
 - New unit tests: `test_hallucination.py`, `test_canary.py`, `test_dataset_builder.py`,
   `test_calibrator.py`, `test_teacher_grounding.py`, `test_drift_predictor.py` (12),
-  `test_eval_factory.py` (12), `test_attribution.py` (11), `test_retriever.py` (8)
-  — suite now **96 passing**.
+  `test_eval_factory.py` (12), `test_attribution.py` (11), `test_retriever.py` (8),
+  `test_detection_hardening.py` (15), `test_curation_hardening.py` (15)
+  — suite now **137 tests collected; 131 pass with no external services** (the 6
+  HMAC tests need a running Vault — see the test-count note earlier in §0).
 
 ### Decisions / still out of scope
 - **Multi-tenancy**: intentionally omitted (single-tenant) — see `src/db/models.py`.

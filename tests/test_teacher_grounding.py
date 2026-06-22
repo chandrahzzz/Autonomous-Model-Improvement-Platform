@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, Mock
 
+import numpy as np
 import pytest
 
 from src.curation.teacher import TeacherModel, GroundingResult
@@ -31,6 +32,9 @@ def _teacher(correction: str, hallucination_prob: float | None) -> TeacherModel:
     t = TeacherModel()
     # Bypass real OpenAI calls — every vote returns the same correction.
     t._single_correction = AsyncMock(return_value=correction)
+    # Avoid loading MiniLM in unit tests: identical votes → identical embeddings
+    # → cosine consistency 1.0 (above threshold), matching the old behaviour.
+    t._embed = lambda texts: np.ones((len(texts), 8))
     if hallucination_prob is not None:
         det = Mock()
         det.score_batch = AsyncMock(return_value=[hallucination_prob])
@@ -100,6 +104,7 @@ async def test_grounding_fields_flow_to_insert_dict():
     ))
     pipe._pii = Mock()
     pipe._pii.scrub_example = Mock(return_value=("q", "Refunds within 30 days.", True))
+    pipe._pii.scrub = Mock(return_value=("Refunds within 30 days.", False))
     pipe._dedup = Mock()
     pipe._dedup.compute_hash = Mock(return_value="hash1")
     pipe._dedup.is_duplicate = Mock(return_value=False)

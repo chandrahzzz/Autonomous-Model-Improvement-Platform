@@ -47,6 +47,35 @@ hallucination_score_histogram = Histogram(
     buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
 )
 
+# ── Detection hardening (June 2026) ────────────────────────────────────────────
+hallucination_premise_missing_total = Counter(
+    "hallucination_premise_missing_total",
+    "RAG-flagged calls whose retrieved_context was missing, so the NLI premise "
+    "silently fell back to the prompt (factual grounding could not be verified)",
+)
+detector_insufficient_data_total = Counter(
+    "detector_insufficient_data_total",
+    "Times an aggregate detector signal was suppressed for too few samples",
+    ["detector"],  # drift | refusal | format
+)
+correlated_failures_collapsed_total = Counter(
+    "correlated_failures_collapsed_total",
+    "Duplicate failure events on the same log collapsed into one (multi-detector)",
+)
+drift_baseline_age_hours = Gauge(
+    "drift_baseline_age_hours",
+    "Age of the active drift baseline in hours (-1 if none loaded)",
+)
+format_baseline_age_hours = Gauge(
+    "format_baseline_age_hours",
+    "Age of the format length baseline in hours (-1 if none seeded)",
+)
+detector_window_size = Gauge(
+    "detector_window_size",
+    "Current number of samples in a detector's rolling window",
+    ["detector"],  # drift | refusal | format
+)
+
 # ── Curation ─────────────────────────────────────────────────────────────────
 examples_curated_total = Counter(
     "examples_curated_total",
@@ -66,6 +95,34 @@ examples_dropped_dedup = Counter(
 examples_dropped_quality = Counter(
     "examples_dropped_quality_total",
     "Examples dropped due to low quality score",
+)
+
+# ── Curation hardening (June 2026) ─────────────────────────────────────────────
+examples_pre_scrubbed_total = Counter(
+    "examples_pre_scrubbed_total",
+    "Examples whose prompt+completion were PII-scrubbed BEFORE the teacher API "
+    "call (so raw PII never leaves for OpenAI)",
+)
+examples_dropped_pre_scrub_total = Counter(
+    "examples_dropped_pre_scrub_total",
+    "Examples dropped (fail-closed) because PII scrubbing failed before the "
+    "teacher was ever called",
+)
+teacher_rate_limit_retries_total = Counter(
+    "teacher_rate_limit_retries_total",
+    "Teacher API calls retried after a rate-limit / transient error",
+)
+teacher_dropped_rate_limited_total = Counter(
+    "teacher_dropped_rate_limited_total",
+    "Teacher corrections dropped after exhausting rate-limit retries",
+)
+clustering_bypassed_total = Counter(
+    "clustering_bypassed_total",
+    "Curation cycles where clustering was bypassed (all failures noise-labelled)",
+)
+dedup_index_size = Gauge(
+    "dedup_index_size",
+    "Number of entries in the in-memory MinHash LSH near-duplicate index",
 )
 
 pending_examples_gauge = Gauge(

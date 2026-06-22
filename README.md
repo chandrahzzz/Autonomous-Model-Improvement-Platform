@@ -148,6 +148,41 @@ All configuration is in `.env`. Key variables:
 | `ATTRIBUTION_ENABLED` | true | RFC-003 failure→training-example influence attribution |
 | `RETRIEVAL_ENABLED` | true | Domain retriever — grounds the teacher when no context is attached |
 | `RETRIEVAL_MIN_SIMILARITY` | 0.30 | Cosine floor for a retrieved doc to count as relevant |
+| `DRIFT_BASELINE_MAX_AGE_HOURS` | 24.0 | Auto-refresh the drift baseline once it ages past this (not just on promotion) |
+| `FORMAT_BASELINE_MAX_AGE_HOURS` | 24.0 | Same age-out for the format length baseline |
+| `DRIFT_MIN_WINDOW` / `REFUSAL_MIN_SAMPLES` | 50 | Min samples before drift/refusal aggregate signals may fire |
+| `DETECTOR_STATE_PERSIST_ENABLED` | true | Persist detector rolling windows to Redis so restarts don't reset them |
+| `CORRELATE_FAILURES_ENABLED` | true | Collapse multi-detector hits on one log into a single failure event |
+| `TEACHER_SEMANTIC_CONSISTENCY_THRESHOLD` | 0.80 | MiniLM-cosine agreement needed across the 3 teacher votes |
+| `TEACHER_MAX_RETRIES` | 5 | Exponential-backoff retries on OpenAI 429 / timeout before dropping |
+| `DEDUP_REHYDRATE_ENABLED` | true | Rebuild the MinHash near-dup index from the DB on startup |
+
+### Detection-layer hardening (June 2026)
+Six production gaps in the failure-detection layer were closed (plus a real
+double-scoring bug). All additive and kill-switched:
+- **Grounding visibility** — hallucination events carry `premise_source`/`grounded`;
+  RAG calls (`is_rag`) missing their context are counted (`hallucination_premise_missing_total`) and surfaced on `/health` instead of being silently graded against the prompt.
+- **Self-healing baselines** — drift *and* format baselines age out and auto-refresh
+  independently of promotions, so a 48h shadow window can't leave them stale (`drift_baseline_age_hours` / `format_baseline_age_hours` gauges, shown on `/health`).
+- **Quiet-traffic guards** — drift/refusal/format aggregate signals return
+  `insufficient_data` below a min-sample floor rather than firing false positives.
+- **Restart-safe windows** — detector rolling windows persist to Redis and rehydrate
+  on startup, so refusal rate / drift trend don't reset to a misleading clean slate after a deploy.
+- **Failure correlation** — when several detectors fire on the same log, only the
+  highest-severity event is emitted (others recorded in `metadata.all_failure_types`), so the curator makes one correction, not duplicates.
+
+### Curation-layer hardening (June 2026)
+Five production gaps in the curation pipeline were closed. All additive and kill-switched:
+- **PII never leaves for OpenAI** — Presidio scrubs the prompt *and* bad completion
+  **before** the teacher API call (fail-closed drop on scrub failure); the teacher output is scrubbed again, and the stored `bad_completion` is the scrubbed version.
+- **Semantic self-consistency** — the teacher's 3-vote confidence uses MiniLM cosine
+  (meaning) instead of ROUGE-L (surface overlap), so paraphrase agreement counts as confidence and divergent meanings don't.
+- **Rate-limit resilience** — teacher calls retry OpenAI 429/timeout/connection errors
+  with exponential backoff + jitter (`teacher_rate_limit_retries_total`) instead of silently dropping the example.
+- **Batch-aware clustering** — HDBSCAN `min_cluster_size` scales to the batch so small
+  early-deployment batches still cluster; all-noise batches bypass cleanly (`clustering_bypassed_total`).
+- **Restart-safe dedup** — the MinHash near-duplicate index rehydrates from the DB on
+  startup so near-dupes (that the exact-hash DB index can't catch) don't re-enter after a restart.
 
 ---
 
@@ -258,6 +293,12 @@ make test-integration
 # Coverage report
 make test-cov
 ```
+
+**Suite status:** 137 tests collected. 131 pass locally with no external services.
+The 6 `tests/integration/test_audit_integrity.py` + `test_pipeline_cycle.py` HMAC
+tests require a running Vault — they **fail loudly by design** when
+`VAULT_REQUIRED=true` and Vault is unreachable (this is the fail-closed audit
+behaviour, not a regression). Set `VAULT_REQUIRED=false` or start Vault to run them.
 
 ---
 

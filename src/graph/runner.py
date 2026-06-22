@@ -107,10 +107,85 @@ class PipelineRunner:
         except Exception:
             log.warning("pipeline_full_state_persist_failed")
 
+    async def _rehydrate_detectors(self) -> None:
+        """Restore detector rolling windows on startup (#4) so refusal rate /
+        drift trend / format distribution don't reset to a misleading clean slate
+        after a deploy or crash."""
+        if not settings.detector_state_persist_enabled:
+            return
+        try:
+            from src.graph.nodes.failure_detector import _drift, _refusal, _fmt
+            r = aioredis.from_url(settings.redis_url, decode_responses=True)
+            try:
+                await _drift.load_window_state(r)
+                await _refusal.load_window_state(r)
+                await _fmt.load_window_state(r)
+            finally:
+                await r.aclose()
+        except Exception:
+            log.warning("detector_state_rehydrate_failed")
+
+    async def _persist_detectors(self) -> None:
+        """Persist detector rolling windows each cycle and publish window/age
+        gauges for observability."""
+        try:
+            from src.graph.nodes.failure_detector import _drift, _refusal, _fmt
+            from src.monitoring.metrics import (
+                detector_window_size, drift_baseline_age_hours, format_baseline_age_hours,
+            )
+            if settings.detector_state_persist_enabled:
+                r = aioredis.from_url(settings.redis_url, decode_responses=True)
+                try:
+                    await _drift.save_window_state(r)
+                    await _refusal.save_window_state(r)
+                    await _fmt.save_window_state(r)
+                finally:
+                    await r.aclose()
+            detector_window_size.labels(detector="drift").set(_drift.window_size)
+            detector_window_size.labels(detector="refusal").set(_refusal.window_size)
+            detector_window_size.labels(detector="format").set(_fmt.window_size)
+            drift_baseline_age_hours.set(_drift.baseline_age_hours if _drift.baseline_age_hours is not None else -1.0)
+            format_baseline_age_hours.set(_fmt.baseline_age_hours if _fmt.baseline_age_hours is not None else -1.0)
+        except Exception:
+            log.warning("detector_state_persist_failed")
+
+    async def _maybe_refresh_baselines(self) -> None:
+        """Age out the drift + format baselines independently of promotions (#2/#5).
+
+        A long 48h shadow window or a rollback storm means no promotion fires, so
+        a promotion-only refresh lets the baseline drift stale → false alarms and
+        wasted GPU/teacher spend. Here we refresh whenever a baseline exceeds its
+        max age, gated by enough fresh known-good samples."""
+        interval = settings.baseline_refresh_check_interval_cycles
+        cycle = self._state.get("cycles_completed", 0)
+        if interval <= 0 or cycle == 0 or cycle % interval != 0:
+            return
+        try:
+            from src.graph.nodes.failure_detector import _drift, _fmt
+            from src.db.connection import get_db
+            from src.db.repositories.llm_logs import LLMLogRepository
+            version = self._state.get("production_version")
+            if not (_drift.is_baseline_stale() or _fmt.is_baseline_stale()):
+                return
+            async with get_db() as db:
+                await _drift.load_baseline(db)  # ensure age/state is current
+                if _drift.is_baseline_stale():
+                    await _drift.refresh_baseline(
+                        db, model_version=version or "unknown",
+                        min_samples=settings.drift_baseline_min_samples,
+                    )
+                if _fmt.is_baseline_stale():
+                    completions = await LLMLogRepository(db).get_recent_completions(limit=10000)
+                    _fmt.refresh_baseline(completions)
+            log.info("baselines_age_refresh_checked", version=version)
+        except Exception:
+            log.warning("baseline_age_refresh_failed")
+
     async def run_forever(self) -> None:
         self._running = True
         log.info("pipeline_runner_starting", environment=settings.environment)
         await self._rehydrate_state()
+        await self._rehydrate_detectors()
 
         # Register graceful shutdown handlers
         loop = asyncio.get_running_loop()
@@ -187,6 +262,8 @@ class PipelineRunner:
         )
         await self._persist_full_state()
         await self._publish_state()
+        await self._persist_detectors()
+        await self._maybe_refresh_baselines()
         await self._maybe_calibrate()
 
     async def _maybe_calibrate(self) -> None:

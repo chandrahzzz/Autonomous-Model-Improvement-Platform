@@ -6,8 +6,10 @@ Tracks a rolling baseline refusal rate and fires when current rate
 exceeds baseline × refusal_rate_multiplier.
 """
 
+import json
 import re
 from collections import deque
+from typing import Any
 
 import structlog
 from sentence_transformers import SentenceTransformer, util
@@ -81,8 +83,49 @@ class RefusalDetector:
             return 0.0
         return sum(self._window) / len(self._window)
 
+    @property
+    def window_size(self) -> int:
+        return len(self._window)
+
     def is_creeping(self) -> bool:
+        """Fire only once the window has enough samples — otherwise a couple of
+        refusals in quiet traffic would read as a 100% refusal rate (#3)."""
+        if len(self._window) < settings.refusal_min_samples:
+            from src.monitoring.metrics import detector_insufficient_data_total
+            detector_insufficient_data_total.labels(detector="refusal").inc()
+            return False
         return self.current_refusal_rate > self._baseline_rate * settings.refusal_rate_multiplier
 
     def set_baseline_rate(self, rate: float) -> None:
         self._baseline_rate = rate
+
+    # ── Rolling-window persistence (#4) ────────────────────────────────────────
+    # Without this, a restart resets the refusal-rate window to empty, reading as
+    # 0% for the first ~500 requests and defeating creep detection right after a
+    # deploy. Persist the boolean window to Redis and rehydrate on startup.
+    async def save_window_state(self, redis: Any) -> None:
+        if not settings.detector_state_persist_enabled:
+            return
+        key = f"{settings.detector_state_redis_prefix}:refusal_window"
+        try:
+            await redis.set(key, json.dumps([int(b) for b in self._window]))
+        except Exception:
+            log.warning("refusal_window_persist_failed")
+
+    async def load_window_state(self, redis: Any) -> None:
+        if not settings.detector_state_persist_enabled:
+            return
+        key = f"{settings.detector_state_redis_prefix}:refusal_window"
+        try:
+            raw = await redis.get(key)
+        except Exception:
+            log.warning("refusal_window_rehydrate_failed")
+            return
+        if not raw:
+            return
+        try:
+            values = json.loads(raw)
+            self._window = deque((bool(v) for v in values), maxlen=WINDOW_SIZE)
+            log.info("refusal_window_rehydrated", n=len(self._window))
+        except (ValueError, TypeError):
+            log.warning("refusal_window_rehydrate_parse_failed")

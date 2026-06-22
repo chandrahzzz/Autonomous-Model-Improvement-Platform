@@ -13,18 +13,58 @@ can't be silently "corrected" with GPT-4o's outside (and possibly wrong) knowled
 
 import asyncio
 import hashlib
+import random
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
+import numpy as np
 import structlog
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.config.settings import settings
 from src.detection.failure_classifier import FailureEvent
-from src.monitoring.metrics import teacher_corrections_rejected_grounding_total
+from src.monitoring.metrics import (
+    teacher_corrections_rejected_grounding_total,
+    teacher_rate_limit_retries_total,
+    teacher_dropped_rate_limited_total,
+)
 
 log = structlog.get_logger()
+
+# Transient OpenAI errors worth retrying with backoff (vs. dropping the example).
+try:
+    from openai import RateLimitError, APITimeoutError, APIConnectionError, InternalServerError
+    _RETRYABLE_ERRORS: tuple[type[Exception], ...] = (
+        RateLimitError, APITimeoutError, APIConnectionError, InternalServerError,
+    )
+except Exception:  # pragma: no cover - openai always present in this project
+    _RETRYABLE_ERRORS = ()
+
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+@lru_cache(maxsize=1)
+def _shared_encoder():
+    """One process-wide MiniLM encoder for the semantic consistency vote.
+    Lazy + cached so importing teacher.py doesn't load the model and we don't
+    keep a 4th copy beyond drift/refusal/clusterer."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(EMBEDDING_MODEL)
+
+
+def _mean_pairwise_cosine(embeddings: np.ndarray) -> float:
+    """Mean pairwise cosine similarity across rows (1.0 = identical meaning)."""
+    n = len(embeddings)
+    if n < 2:
+        return 1.0
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-12
+    unit = embeddings / norms
+    sims = unit @ unit.T
+    iu = np.triu_indices(n, k=1)
+    return float(np.clip(sims[iu].mean(), 0.0, 1.0))
 
 SYSTEM_PROMPT = """You are an expert LLM evaluator and corrector.
 You will be given an AI assistant's output that has a specific quality failure.
@@ -146,9 +186,12 @@ class TeacherModel:
             if len(valid) < 2:
                 return None  # not enough votes to judge consistency
 
-            # 4. Self-consistency confidence (unchanged logic).
-            confidence = self._compute_consistency_score(valid)
-            if confidence < settings.teacher_confidence_threshold:
+            # 4. Self-consistency confidence — SEMANTIC (MiniLM cosine), so
+            # paraphrases of the same answer count as agreement and divergent
+            # meanings don't. Embed the votes once and reuse for picking the best.
+            embeddings = self._embed(valid)
+            confidence = self._compute_consistency_score(valid, embeddings)
+            if confidence < settings.teacher_semantic_consistency_threshold:
                 log.debug(
                     "teacher_confidence_below_threshold",
                     failure_type=failure.failure_type,
@@ -156,8 +199,8 @@ class TeacherModel:
                 )
                 return None
 
-            # 5. Pick the most representative correction.
-            best = self._pick_best(valid)
+            # 5. Pick the most representative (most semantically central) correction.
+            best = self._pick_best(valid, embeddings)
 
             # Teacher signalled the context can't answer the question.
             if grounding_required and INSUFFICIENT in best.upper():
@@ -248,20 +291,52 @@ class TeacherModel:
     async def _single_correction(
         self, teacher_prompt: str, use_sampler: bool = False
     ) -> str | None:
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=teacher_prompt),
+        ]
+        llm = self._sampler_llm if use_sampler else self._llm
         async with self._semaphore:
-            try:
-                messages = [
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(content=teacher_prompt),
-                ]
-                llm = self._sampler_llm if use_sampler else self._llm
-                response = await llm.ainvoke(messages)
-                text = str(response.content).strip()
-                self._total_cost_usd += self._estimate_cost(teacher_prompt, text)
-                return text
-            except Exception:
-                log.exception("teacher_single_correction_failed")
-                return None
+            for attempt in range(settings.teacher_max_retries + 1):
+                try:
+                    response = await llm.ainvoke(messages)
+                    text = str(response.content).strip()
+                    self._total_cost_usd += self._estimate_cost(teacher_prompt, text)
+                    return text
+                except _RETRYABLE_ERRORS as exc:
+                    if attempt >= settings.teacher_max_retries:
+                        teacher_dropped_rate_limited_total.inc()
+                        log.warning(
+                            "teacher_dropped_rate_limited",
+                            attempts=attempt + 1, error=type(exc).__name__,
+                        )
+                        return None
+                    teacher_rate_limit_retries_total.inc()
+                    delay = min(
+                        settings.teacher_retry_base_delay_seconds * (2 ** attempt),
+                        settings.teacher_retry_max_delay_seconds,
+                    )
+                    delay += random.uniform(0, settings.teacher_retry_base_delay_seconds)
+                    log.info(
+                        "teacher_rate_limit_retry",
+                        attempt=attempt + 1, delay=round(delay, 2),
+                        error=type(exc).__name__,
+                    )
+                    await asyncio.sleep(delay)
+                except Exception:
+                    log.exception("teacher_single_correction_failed")
+                    return None
+        return None
+
+    def _embed(self, texts: list[str]) -> np.ndarray | None:
+        """Embed correction candidates with MiniLM for the semantic consistency
+        vote. Returns None on failure so callers fall back to ROUGE-L. Overridable
+        in tests to avoid loading the model."""
+        try:
+            return np.asarray(_shared_encoder().encode(texts, show_progress_bar=False))
+        except Exception:
+            log.warning("teacher_embed_failed_falling_back_to_rouge")
+            return None
 
     async def _verify_grounding(self, correction: str, context: str) -> float:
         """NLI entailment of the correction by the context, via the existing
@@ -288,11 +363,22 @@ class TeacherModel:
         digest = hashlib.sha256(context.encode("utf-8")).hexdigest()[:12]
         return [f"context_hash:{digest}"]
 
-    def _pick_best(self, corrections: list[str]) -> str:
-        """Return the correction with the highest mean pairwise ROUGE-L vs the
-        others (the most representative / least outlier answer)."""
+    def _pick_best(self, corrections: list[str], embeddings: np.ndarray | None = None) -> str:
+        """Return the most representative correction: the one closest (cosine) to
+        the centroid of all votes. Falls back to mean-pairwise-ROUGE-L when
+        embeddings aren't available."""
         if len(corrections) == 1:
             return corrections[0]
+        if embeddings is not None and len(embeddings) == len(corrections):
+            try:
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                norms[norms == 0] = 1e-12
+                unit = embeddings / norms
+                centroid = unit.mean(axis=0)
+                sims = unit @ centroid
+                return corrections[int(np.argmax(sims))]
+            except Exception:
+                pass
         try:
             from rouge_score import rouge_scorer
             scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
@@ -315,10 +401,17 @@ class TeacherModel:
         return (input_tokens * _INPUT_COST_PER_TOKEN
                 + output_tokens * _OUTPUT_COST_PER_TOKEN)
 
-    def _compute_consistency_score(self, corrections: list[str]) -> float:
-        """ROUGE-L pairwise overlap as consistency proxy. (Unchanged.)"""
+    def _compute_consistency_score(
+        self, corrections: list[str], embeddings: np.ndarray | None = None
+    ) -> float:
+        """Semantic self-consistency: mean pairwise MiniLM cosine across the
+        votes. Paraphrases of one answer score high; divergent meanings score
+        low. ROUGE-L is the secondary fallback only when embeddings are
+        unavailable (it measures surface overlap, not meaning)."""
         if len(corrections) == 1:
             return 1.0
+        if embeddings is not None and len(embeddings) == len(corrections):
+            return _mean_pairwise_cosine(embeddings)
         try:
             from rouge_score import rouge_scorer
             scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)

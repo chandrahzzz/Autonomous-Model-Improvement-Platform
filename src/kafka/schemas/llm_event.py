@@ -14,6 +14,11 @@ class LLMEvent(BaseModel):
     # (NLI entailment) checks in the hallucination detector instead of falling
     # back to the prompt. Empty for non-RAG traffic.
     retrieved_context: str = ""
+    # Whether this call was a retrieval-augmented (RAG) generation. When True the
+    # hallucination detector EXPECTS retrieved_context; if it's missing the call
+    # is counted (hallucination_premise_missing_total) and the resulting NLI score
+    # is flagged ungrounded rather than silently graded against the bare prompt.
+    is_rag: bool = False
     prompt_tokens: int
     completion_tokens: int
     latency_ms: int

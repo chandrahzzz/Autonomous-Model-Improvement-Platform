@@ -79,6 +79,25 @@ class Settings(BaseSettings):
     refusal_rate_multiplier: float = 2.0
     format_kl_threshold: float = 0.5
 
+    # Detection hardening (production gaps closed June 2026) — all additive.
+    # #2/#5 Baselines auto-refresh after promotion AND age out independently so a
+    # long 48h shadow window / rollback storm can't leave them stale.
+    drift_baseline_max_age_hours: float = 24.0
+    format_baseline_max_age_hours: float = 24.0
+    baseline_refresh_check_interval_cycles: int = 10   # how often the runner checks age
+    # #3 Rate/window-based signals refuse to fire on too-few samples (returns
+    # "insufficient_data" instead of a noisy false-positive on quiet traffic).
+    drift_min_window: int = 50
+    refusal_min_samples: int = 50
+    format_min_samples: int = 100
+    # #4 Rolling-window state persists to Redis so a process restart doesn't reset
+    # refusal rate / drift trend to a misleading clean slate.
+    detector_state_persist_enabled: bool = True
+    detector_state_redis_prefix: str = "pipeline:detector_state"
+    # #6 Collapse multiple detectors firing on the same log into one failure event
+    # (highest severity) so the curator generates one correction, not duplicates.
+    correlate_failures_enabled: bool = True
+
     # Continuous eval factory (RFC-002) — purely additive, off via the flag.
     eval_factory_enabled: bool = True
     eval_factory_trigger_every_n_requests: int = 1000
@@ -115,10 +134,25 @@ class Settings(BaseSettings):
 
     # Curation
     teacher_confidence_threshold: float = 0.85
+    # Self-consistency is now semantic (MiniLM cosine across the votes) instead of
+    # ROUGE-L surface overlap, so paraphrases of the same answer count as agreement
+    # and divergent meanings don't. Cosine sits lower than ROUGE for paraphrases,
+    # hence a dedicated (slightly lower) threshold.
+    teacher_semantic_consistency_threshold: float = 0.80
     teacher_consistency_temperature: float = 0.7  # >0 so self-consistency votes differ
     max_concurrent_teacher_calls: int = 20
     curation_cost_budget_usd: float = 25.0  # Per-run circuit breaker
+    # OpenAI rate-limit resilience: retry 429 / timeout / connection errors with
+    # exponential backoff + jitter instead of silently dropping the example.
+    teacher_max_retries: int = 5
+    teacher_retry_base_delay_seconds: float = 1.0
+    teacher_retry_max_delay_seconds: float = 30.0
     dedup_jaccard_threshold: float = 0.85
+    # Rehydrate the in-memory MinHash LSH near-dup index from existing
+    # training_examples on the first curation cycle so a restart doesn't let
+    # near-duplicates (that the DB exact-hash index can't catch) re-enter.
+    dedup_rehydrate_enabled: bool = True
+    dedup_rehydrate_limit: int = 50000
     quality_rouge_threshold: float = 0.30
     pii_fail_closed: bool = True
 

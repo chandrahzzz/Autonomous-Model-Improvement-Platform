@@ -64,3 +64,27 @@ class Deduplicator:
 
     def compute_hash(self, prompt: str, completion: str) -> str:
         return _dedup_hash(prompt, completion)
+
+    def preload(self, pairs: list[tuple[str, str]]) -> int:
+        """Seed the LSH index from existing (prompt, completion) pairs — called
+        once on startup so near-duplicates survive a process restart. Idempotent:
+        already-seen exact hashes are skipped. Returns the number of entries now
+        indexed."""
+        for prompt, completion in pairs:
+            if prompt is None or completion is None:
+                continue
+            exact_hash = _dedup_hash(prompt, completion)
+            if exact_hash in self._seen:
+                continue
+            minhash = _text_to_minhash(f"{prompt} {completion}")
+            try:
+                self._lsh.insert(exact_hash, minhash)
+            except Exception:
+                # LSH raises if a key already exists — safe to ignore.
+                pass
+            self._seen.add(exact_hash)
+        return len(self._seen)
+
+    @property
+    def size(self) -> int:
+        return len(self._seen)

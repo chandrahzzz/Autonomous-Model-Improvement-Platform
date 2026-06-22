@@ -52,6 +52,7 @@ class ModelRepository:
             "centroid": json.dumps(baseline.centroid),
             "covariance_inv": json.dumps(baseline.covariance_inv),
             "sample_size": baseline.sample_size,
+            "computed_at": baseline.computed_at.isoformat() if baseline.computed_at else None,
         }
 
     async def save_baseline(self, model_version: str, data: dict[str, Any]) -> None:
