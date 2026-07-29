@@ -157,12 +157,15 @@ class CurationPipeline:
 
         return {
             "llm_log_id": failure.llm_log_id if failure.llm_log_id != "unknown" else None,
+            # Link the persisted failure_classifications row so lineage
+            # (training_example → failure → log) is traceable.
+            "failure_id": failure.metadata.get("failure_classification_id"),
             "prompt": scrubbed_prompt,
             "bad_completion": scrubbed_bad[:4000],
             "corrected_completion": scrubbed_completion,
             "failure_type": failure.failure_type,
             "cluster_id": failure.metadata.get("cluster_id"),
-            "teacher_model": "gpt-4o",
+            "teacher_model": settings.teacher_model,
             "teacher_confidence": confidence,
             "pii_scrubbed": True,
             "dedup_hash": dedup_hash,

@@ -34,32 +34,26 @@ services:
       timeout: 3s
       retries: 5
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper
-
-  kafka:
-    image: confluentinc/cp-kafka:7.6.0
-    depends_on:
-      - zookeeper
+  # Redpanda: Kafka-API-compatible broker in a single binary — no Zookeeper, no
+  # JVM, ~10x less memory. Fits the Oracle-free-tier / cheap-VPS footprint; the
+  # existing confluent-kafka producer/consumer code works against it unchanged.
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
     ports:
       - "9092:9092"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      - "9644:9644"   # admin API / metrics
     volumes:
-      - kafka_data:/var/lib/kafka
+      - redpanda_data:/var/lib/redpanda/data
     healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 5
@@ -92,7 +86,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  kafka_data:
-  zookeeper_data:
+  redpanda_data:
   prometheus_data:
   grafana_data:

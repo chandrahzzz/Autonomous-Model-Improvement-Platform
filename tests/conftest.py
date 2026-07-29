@@ -31,6 +31,27 @@ def mock_settings(monkeypatch):
     monkeypatch.setenv("MODAL_TOKEN_SECRET", "test")
     monkeypatch.setenv("VAULT_TOKEN", "root")
 
+    # Pin demo-overridable settings to their PRODUCTION defaults so a local .env
+    # with demo overrides (lowered trigger sizes, drift thresholds, feature flags)
+    # can't change test outcomes. The settings singleton is already constructed
+    # from .env at import, so setenv won't take — override the attributes directly.
+    from src.config.settings import settings
+    _prod_defaults = {
+        "training_trigger_dataset_size": 500,
+        "training_trigger_drift_threshold": 0.15,
+        "training_min_interval_hours": 6,
+        "ab_min_requests": 1000,
+        "ab_min_hours": 48.0,
+        "hallucination_require_context": False,
+        "retrieval_enabled": True,
+        "eval_factory_enabled": True,
+        "attribution_enabled": True,
+        "drift_prediction_enabled": True,
+    }
+    for name, value in _prod_defaults.items():
+        if hasattr(settings, name):
+            monkeypatch.setattr(settings, name, value)
+
 
 # ── Mock DB session ───────────────────────────────────────────────────────────
 @pytest.fixture

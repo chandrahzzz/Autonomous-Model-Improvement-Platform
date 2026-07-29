@@ -1,27 +1,32 @@
 """
-Teacher model correction generation (RAG-grounded).
+Teacher model correction generation (RAG-grounded), $0 stack.
 
-Uses GPT-4o to generate the ideal corrected completion for each failure.
-Confidence is a self-consistency score (pairwise ROUGE-L across 3 corrections).
+Uses the Groq free tier (permanent, ~30 req/min, no card required) instead of
+GPT-4o. Self-consistency votes come from THREE DIFFERENT free models
+(Llama-3-70B / Mixtral / Gemma-9B by default) run concurrently — cross-model
+agreement is a stronger consensus signal than temperature-resampling a single
+model, and it costs the same: $0. Consensus is scored semantically (mean
+pairwise MiniLM cosine) and the centroid-nearest vote is kept.
 
-When the original production answer used retrieved context (`llm_logs.retrieved_context`),
-the teacher is constrained to answer ONLY from that context and the correction is
-verified against it with the existing NLI detector. Corrections that aren't entailed
-by their context are dropped, so domain-specific (policy/pricing/internal) failures
-can't be silently "corrected" with GPT-4o's outside (and possibly wrong) knowledge.
+When the original production answer used retrieved context
+(`llm_logs.retrieved_context`), the teacher is constrained to answer ONLY from
+that context and the correction is verified against it with the existing NLI
+detector. Corrections that aren't entailed by their context are dropped, so
+domain-specific (policy/pricing/internal) failures can't be silently
+"corrected" with the teacher's outside (and possibly wrong) knowledge.
 """
 
 import asyncio
 import hashlib
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
+from types import SimpleNamespace
 
 import numpy as np
 import structlog
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.config.settings import settings
 from src.detection.failure_classifier import FailureEvent
@@ -33,13 +38,19 @@ from src.monitoring.metrics import (
 
 log = structlog.get_logger()
 
-# Transient OpenAI errors worth retrying with backoff (vs. dropping the example).
+# Transient Groq errors worth retrying with backoff (vs. dropping the example).
+# The groq SDK mirrors the openai SDK's exception hierarchy.
 try:
-    from openai import RateLimitError, APITimeoutError, APIConnectionError, InternalServerError
+    from groq import (
+        RateLimitError,
+        APITimeoutError,
+        APIConnectionError,
+        InternalServerError,
+    )
     _RETRYABLE_ERRORS: tuple[type[Exception], ...] = (
         RateLimitError, APITimeoutError, APIConnectionError, InternalServerError,
     )
-except Exception:  # pragma: no cover - openai always present in this project
+except Exception:  # pragma: no cover - groq installed in this project
     _RETRYABLE_ERRORS = ()
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -52,6 +63,58 @@ def _shared_encoder():
     keep a 4th copy beyond drift/refusal/clusterer."""
     from sentence_transformers import SentenceTransformer
     return SentenceTransformer(EMBEDDING_MODEL)
+
+
+@lru_cache(maxsize=1)
+def _groq_client():
+    """One process-wide AsyncGroq client (connection pool reuse)."""
+    from groq import AsyncGroq
+    return AsyncGroq(api_key=settings.groq_api_key)
+
+
+class _RatePacer:
+    """Client-side pacing for Groq's free-tier request/min ceiling. Serializes
+    call STARTS so concurrent teacher calls (asyncio.gather across a batch)
+    never burst past the limit; the calls themselves still overlap."""
+
+    def __init__(self, requests_per_minute: int) -> None:
+        self._interval = 60.0 / max(1, requests_per_minute)
+        self._lock = asyncio.Lock()
+        self._last_start = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            delay = self._last_start + self._interval - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_start = time.monotonic()
+
+
+@lru_cache(maxsize=1)
+def _shared_pacer() -> _RatePacer:
+    return _RatePacer(settings.groq_requests_per_minute)
+
+
+class _GroqChat:
+    """Thin ChatOpenAI-shaped adapter over AsyncGroq: `ainvoke(messages)` takes
+    a list of {"role", "content"} dicts and returns an object with `.content`.
+    Keeping this interface means the retry loop (and its tests) don't care which
+    provider is behind it."""
+
+    def __init__(self, model: str, temperature: float = 0.0) -> None:
+        self.model = model
+        self.temperature = temperature
+
+    async def ainvoke(self, messages: list[dict]) -> SimpleNamespace:
+        await _shared_pacer().wait()
+        resp = await _groq_client().chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=1024,
+        )
+        return SimpleNamespace(content=resp.choices[0].message.content or "")
 
 
 def _mean_pairwise_cosine(embeddings: np.ndarray) -> float:
@@ -68,19 +131,21 @@ def _mean_pairwise_cosine(embeddings: np.ndarray) -> float:
 
 SYSTEM_PROMPT = """You are an expert LLM evaluator and corrector.
 You will be given an AI assistant's output that has a specific quality failure.
-Your task is to provide the IDEAL corrected response — accurate, helpful,
-well-formatted, non-refusatory, and factually grounded.
-Only output the corrected response text. No explanations."""
+Provide the IDEAL corrected response: accurate, factually grounded, and DIRECT.
 
-# Minimum NLI entailment of a correction by its context to accept it.
+STRICT OUTPUT RULES:
+- Output ONLY the corrected answer text — nothing else.
+- Be terse. State the facts directly. Prefer 1-3 sentences.
+- NO preamble ("Sure", "Based on the context", "Here is"), NO sign-off
+  ("Let me know", "I hope this helps"), NO meta-commentary, NO apologies.
+- Every sentence must be a factual claim supported by the source; do not add
+  filler, opinions, or conversational remarks."""
+
+# Minimum NLI entailment of a correction by its context to accept it (module
+# fallback; the live value is settings.teacher_grounding_threshold).
 GROUNDING_THRESHOLD = 0.50
 # Sentinel the teacher emits when the context can't answer the question.
 INSUFFICIENT = "INSUFFICIENT_CONTEXT"
-
-# GPT-4o pricing (USD per token), used for the per-run cost circuit breaker.
-_INPUT_COST_PER_TOKEN = 5e-6
-_OUTPUT_COST_PER_TOKEN = 15e-6
-_CHARS_PER_TOKEN = 4.0
 
 # Source-ID extraction patterns for retrieved_context.
 _SOURCE_PATTERNS = [
@@ -97,7 +162,7 @@ _UUID_RE = re.compile(
 @dataclass
 class GroundingResult:
     correction: str
-    confidence: float                 # self-consistency (ROUGE-L across 3 votes)
+    confidence: float                 # cross-model semantic self-consistency
     grounding_score: float | None     # NLI entailment vs context; None if no context
     grounding_sources: list[str] = field(default_factory=list)
     is_grounded: bool = True
@@ -105,22 +170,21 @@ class GroundingResult:
 
 class TeacherModel:
     def __init__(self) -> None:
-        # temperature=0.0 base model used for the deterministic answer.
-        self._llm = ChatOpenAI(
-            model=settings.teacher_model,
-            temperature=0.0,
-            api_key=settings.openai_api_key,
-        )
-        # Separate sampler at >0 temperature for the self-consistency votes —
-        # at temp 0 the extra samples are identical and the ROUGE consistency
-        # score is meaninglessly ~1.0 while still costing N× the API calls.
-        self._sampler_llm = ChatOpenAI(
-            model=settings.teacher_model,
-            temperature=settings.teacher_consistency_temperature,
-            api_key=settings.openai_api_key,
+        # One deterministic client per configured Groq model. Cross-model votes
+        # replace the old temperature-resampling scheme: three independent model
+        # families agreeing on meaning is a stronger signal than one model
+        # agreeing with its own samples.
+        models = settings.teacher_models or [settings.teacher_model]
+        self._llms: list[_GroqChat] = [_GroqChat(m, temperature=0.0) for m in models]
+        self._llm = self._llms[0]
+        # Sampler on the primary model pads the vote count when fewer than
+        # _consistency_n distinct models are configured.
+        self._sampler_llm = _GroqChat(
+            models[0], temperature=settings.teacher_consistency_temperature
         )
         self._consistency_n = 3
-        # Bound simultaneous OpenAI calls across the whole curation batch.
+        # Bound simultaneous Groq calls across the whole curation batch (the
+        # _RatePacer additionally spaces call starts to the req/min ceiling).
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_teacher_calls)
         self._cost_limit_usd = settings.curation_cost_budget_usd
         self._total_cost_usd = 0.0
@@ -175,12 +239,14 @@ class TeacherModel:
                     failure.prompt, failure.completion
                 )
 
-            # 3. Generate corrections (first deterministic, rest sampled).
-            tasks = [self._single_correction(teacher_prompt, use_sampler=False)]
-            tasks += [
-                self._single_correction(teacher_prompt, use_sampler=True)
-                for _ in range(self._consistency_n - 1)
+            # 3. Generate corrections — one vote per configured Groq model,
+            # padded with sampled votes from the primary if needed.
+            tasks = [
+                self._single_correction(teacher_prompt, llm=llm)
+                for llm in self._llms[: self._consistency_n]
             ]
+            while len(tasks) < self._consistency_n:
+                tasks.append(self._single_correction(teacher_prompt, use_sampler=True))
             corrections = await asyncio.gather(*tasks)
             valid = [c for c in corrections if c]
             if len(valid) < 2:
@@ -213,7 +279,7 @@ class TeacherModel:
             # 6. Grounding verification.
             if grounding_required:
                 grounding_score = await self._verify_grounding(best, context)
-                if grounding_score < GROUNDING_THRESHOLD:
+                if grounding_score < settings.teacher_grounding_threshold:
                     log.warning(
                         "teacher_correction_rejected_grounding",
                         grounding_score=round(grounding_score, 3),
@@ -289,13 +355,17 @@ class TeacherModel:
             return None
 
     async def _single_correction(
-        self, teacher_prompt: str, use_sampler: bool = False
+        self,
+        teacher_prompt: str,
+        use_sampler: bool = False,
+        llm: _GroqChat | None = None,
     ) -> str | None:
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=teacher_prompt),
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": teacher_prompt},
         ]
-        llm = self._sampler_llm if use_sampler else self._llm
+        if llm is None:
+            llm = self._sampler_llm if use_sampler else self._llm
         async with self._semaphore:
             for attempt in range(settings.teacher_max_retries + 1):
                 try:
@@ -395,11 +465,10 @@ class TeacherModel:
             return corrections[0]
 
     def _estimate_cost(self, prompt_text: str, output: str) -> float:
-        """Rough per-call cost estimate from character counts."""
-        input_tokens = (len(prompt_text) + len(SYSTEM_PROMPT)) / _CHARS_PER_TOKEN
-        output_tokens = len(output) / _CHARS_PER_TOKEN
-        return (input_tokens * _INPUT_COST_PER_TOKEN
-                + output_tokens * _OUTPUT_COST_PER_TOKEN)
+        """Groq free tier: per-call cost is $0. The budget circuit breaker stays
+        wired so a paid provider can be swapped back in without touching the
+        curation flow."""
+        return 0.0
 
     def _compute_consistency_score(
         self, corrections: list[str], embeddings: np.ndarray | None = None
@@ -425,28 +494,32 @@ class TeacherModel:
             return 0.0
 
     def _build_grounded_prompt(self, prompt: str, bad_answer: str, context: str) -> str:
-        return f"""You are correcting a factually wrong answer.
+        return f"""Correct the wrong answer using ONLY the context below.
+Do not use outside knowledge. If the context lacks the information, respond with
+exactly: {INSUFFICIENT}
 
-CRITICAL RULE: Your correction MUST be based ONLY on the context documents provided below.
-Do not use any outside knowledge. If the context does not contain enough information
-to answer the question correctly, respond with exactly: {INSUFFICIENT}
+Answer in 1-3 short factual sentences drawn only from the context. Output ONLY
+the corrected answer — no preamble, no sign-off, no commentary.
 
-Context documents:
+Context:
 ---
 {context[:6000]}
 ---
 
-Original question: {prompt[:2000]}
+Question: {prompt[:2000]}
 
-Wrong answer that was given: {bad_answer[:2000]}
+Wrong answer: {bad_answer[:2000]}
 
-Correct answer (based strictly on the context above):"""
+Corrected answer:"""
 
     def _build_general_prompt(self, prompt: str, bad_answer: str) -> str:
-        return f"""You are correcting a low-quality answer.
+        return f"""Correct the low-quality answer below.
 
-Original question: {prompt[:2000]}
+Answer in 1-3 short factual sentences. Output ONLY the corrected answer — no
+preamble, no sign-off, no commentary.
 
-Wrong answer that was given: {bad_answer[:2000]}
+Question: {prompt[:2000]}
 
-Provide the ideal corrected response:"""
+Wrong answer: {bad_answer[:2000]}
+
+Corrected answer:"""

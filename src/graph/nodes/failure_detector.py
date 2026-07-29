@@ -87,6 +87,47 @@ async def _handle_drift_prediction(
     except Exception:
         log.exception("drift_prediction_background_error")
 
+_UUID_LEN = 36
+
+
+def _looks_like_uuid(v: str | None) -> bool:
+    return bool(v) and len(v) == _UUID_LEN and v.count("-") == 4
+
+
+async def _persist_classifications(events: list) -> None:
+    """Write one failure_classifications row per event (reusing an existing row
+    for logs already classified), and record the id on event.metadata under
+    'failure_classification_id'. Best-effort: a persistence error must not stop
+    detection/curation, so it's logged and swallowed."""
+    if not events:
+        return
+    log_ids = [e.llm_log_id for e in events if _looks_like_uuid(e.llm_log_id)]
+    try:
+        from src.db.repositories.failure_classifications import FailureClassificationRepository
+        async with get_db() as db:
+            repo = FailureClassificationRepository(db)
+            existing = await repo.existing_for_logs(log_ids)
+            for e in events:
+                if not _looks_like_uuid(e.llm_log_id):
+                    continue
+                if e.llm_log_id in existing:
+                    e.metadata["failure_classification_id"] = existing[e.llm_log_id]
+                    continue
+                cid = await repo.insert({
+                    "llm_log_id": e.llm_log_id,
+                    "failure_type": e.failure_type,
+                    "score": float(e.score),
+                    "cluster_id": e.metadata.get("cluster_id"),
+                    "cluster_label": e.metadata.get("cluster_label"),
+                    "metadata_": {k: v for k, v in e.metadata.items()
+                                  if k != "failure_classification_id"},
+                })
+                e.metadata["failure_classification_id"] = cid
+                existing[e.llm_log_id] = cid
+    except Exception:
+        log.warning("failure_classification_persist_failed")
+
+
 async def failure_detector_node(state: PipelineState) -> PipelineState:
     log_ids = state.get("recent_log_ids", [])
     if not log_ids:
@@ -119,6 +160,15 @@ async def failure_detector_node(state: PipelineState) -> PipelineState:
                 })
 
     batch = await _classifier.classify_batch(events)
+
+    # Persist a failure_classifications row per detected failure so the record
+    # exists in the DB (the known-good replay filter, attribution, lineage and
+    # the calibrator all depend on it — previously it was never written, so bad
+    # logs leaked into the replay buffer as "known-good"). Reuse an existing row
+    # when this same log was already classified in an earlier cycle, and stash the
+    # id in the event metadata so the curator can set training_examples.failure_id.
+    await _persist_classifications(batch.events)
+
     failure_dicts = [
         {
             "llm_log_id": f.llm_log_id,

@@ -21,13 +21,21 @@ async def seed() -> None:
         log_repo = LLMLogRepository(db)
         model_repo = ModelRepository(db)
 
-        recent = await log_repo.get_recent(limit=10000, hours=168)   # last 7 days
+        # Seed the baseline from KNOWN-GOOD logs only (finish_reason='stop',
+        # low latency, and no failure classification). Seeding from all-recent
+        # logs pollutes the baseline with the very drift/hallucination outputs
+        # drift is supposed to detect, inflating the centroid and defeating it.
+        recent = await log_repo.get_known_good_candidates(limit=10000)
+        if len(recent) < 50:
+            # Fall back to all-recent only if there aren't enough clean logs yet.
+            print(f"Only {len(recent)} known-good logs; falling back to recent logs.")
+            recent = await log_repo.get_recent(limit=10000, hours=168)
         if len(recent) < 50:
             print(f"Only {len(recent)} logs found. Need at least 50 for baseline. Exiting.")
             return
 
         texts = [r.completion for r in recent]
-        print(f"Computing baseline from {len(texts)} outputs...")
+        print(f"Computing baseline from {len(texts)} known-good outputs...")
 
         detector = DriftDetector()
         baseline = await detector.compute_baseline(texts)
