@@ -3,7 +3,7 @@ Collects shadow traffic metrics over the 48h window.
 Stores per-request quality deltas for statistical analysis.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -51,35 +51,63 @@ class ABCollector:
         )
         return result.rowcount or 0
 
-    async def collect_window(self, challenger_version: str) -> dict:
+    async def collect_window(
+        self, challenger_version: str, started_at: datetime | None = None
+    ) -> dict:
         """
         Collect all shadow log deltas for a challenger version.
         Returns stats needed for promotion gate decision.
+
+        ``started_at`` is when the shadow test began (from the router's Redis
+        stamp). Elapsed time MUST be measured from it: the previous version
+        computed ``now - (now - ab_min_hours)``, which is always exactly
+        ``ab_min_hours``, so the "48h window" gate was a tautology that always
+        passed. When no stamp exists we fall back to the oldest recorded sample,
+        and to 0.0 when nothing has been recorded at all.
+
+        Every row for the challenger counts — the version tag is unique per
+        shadow test, so a lookback filter would only discard valid early samples.
         """
-        since = datetime.utcnow() - timedelta(hours=settings.ab_min_hours)
         result = await self._db.execute(
             text("""
                 SELECT quality_delta, created_at
                 FROM shadow_logs
                 WHERE challenger_version = :version
-                  AND created_at >= :since
                 ORDER BY created_at ASC
             """),
-            {"version": challenger_version, "since": since},
+            {"version": challenger_version},
         )
         rows = result.fetchall()
 
         deltas = [row.quality_delta for row in rows if row.quality_delta is not None]
         n = len(rows)
-        elapsed_h = (datetime.utcnow() - since).total_seconds() / 3600
+
+        window_start = started_at
+        if window_start is None and rows:
+            window_start = rows[0].created_at
+        elapsed_h = self._hours_since(window_start)
+
+        ready = n >= settings.ab_min_requests and elapsed_h >= settings.ab_min_hours
+        # A challenger that never reaches the request floor must not hold the
+        # graph in ab_test_node forever; force a decision past the ceiling.
+        timed_out = (not ready) and elapsed_h >= settings.ab_max_wait_hours
 
         return {
             "n_requests": n,
             "elapsed_hours": elapsed_h,
             "quality_deltas": deltas,
             "mean_delta": sum(deltas) / len(deltas) if deltas else 0.0,
-            "ready": (
-                n >= settings.ab_min_requests
-                and elapsed_h >= settings.ab_min_hours
-            ),
+            "ready": ready,
+            "timed_out": timed_out,
         }
+
+    @staticmethod
+    def _hours_since(start: datetime | None) -> float:
+        """Hours between ``start`` and now, tolerating naive/aware mixing (rows
+        come back naive-UTC from asyncpg, the Redis stamp is tz-aware)."""
+        if start is None:
+            return 0.0
+        now = datetime.now(timezone.utc)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - start).total_seconds() / 3600)

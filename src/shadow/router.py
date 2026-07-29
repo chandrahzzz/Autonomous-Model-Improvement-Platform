@@ -6,6 +6,8 @@ model for silent scoring. Challenger output is NEVER served to users.
 import random
 import time
 import asyncio
+from datetime import datetime, timezone
+
 import structlog
 
 import redis.asyncio as aioredis
@@ -21,6 +23,9 @@ log = structlog.get_logger()
 
 SHADOW_ACTIVE_KEY = "shadow:active_version"
 SHADOW_ABORT_KEY = "shadow:abort"
+# When the current shadow test began. The A/B window's elapsed time must be
+# measured from here — deriving it from the lookback window made it a constant.
+SHADOW_STARTED_KEY = "shadow:started_at"
 
 
 def _bucket_keep_multiplier(bucket_counts: dict[str, int], current_bucket: str) -> float:
@@ -54,10 +59,29 @@ class ShadowRouter:
     async def set_challenger(self, version_tag: str) -> None:
         await self._redis.set(SHADOW_ACTIVE_KEY, version_tag)
         await self._redis.delete(SHADOW_ABORT_KEY)
+        # Stamp the window start once per challenger so a re-entry into
+        # ab_test_node on a later cycle doesn't keep resetting the clock.
+        await self._redis.set(
+            SHADOW_STARTED_KEY,
+            datetime.now(timezone.utc).isoformat(),
+            nx=True,
+        )
         log.info("shadow_challenger_set", version_tag=version_tag)
+
+    async def get_started_at(self) -> datetime | None:
+        """UTC start of the current shadow window, or None if not recorded."""
+        raw = await self._redis.get(SHADOW_STARTED_KEY)
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     async def clear_challenger(self) -> None:
         await self._redis.delete(SHADOW_ACTIVE_KEY)
+        await self._redis.delete(SHADOW_STARTED_KEY)
         log.info("shadow_challenger_cleared")
 
     async def maybe_shadow(
@@ -139,8 +163,14 @@ class ShadowRouter:
         """Signed quality delta (challenger - production); positive = challenger
         is better. The old metric compared production to *itself* (always 1.0),
         so every challenger scored <= 0 and could never be promoted. We now score
-        against an external reference (LLM judge) or eval-set ground truth."""
+        against an external reference: eval-set ground truth (reference_rouge,
+        the $0 default — no API calls) or an LLM judge (paid, needs an OpenAI
+        key). llm_judge without a key silently degrades to reference scoring
+        rather than abstaining on every request."""
         if settings.shadow_scoring_strategy == "reference_rouge":
+            return self._score_delta_reference(prompt, production, challenger)
+        if not settings.openai_api_key:
+            log.warning("shadow_llm_judge_no_key_using_reference")
             return self._score_delta_reference(prompt, production, challenger)
         return await self._score_delta_llm_judge(prompt, production, challenger)
 

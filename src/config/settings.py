@@ -40,7 +40,21 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langsmith_project: str = "continuous-finetuning"
     base_model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct"
-    teacher_model: str = "gpt-4o"
+    teacher_model: str = "llama-3.3-70b-versatile"  # primary Groq teacher (deterministic vote)
+
+    # Groq teacher ($0 stack): the free tier is permanent (~30 req/min) and serves
+    # current instruct models at 300+ tok/s. Self-consistency votes come from
+    # different models where possible (model diversity beats sampling noise); the
+    # teacher pads to 3 votes by temperature-resampling the primary when fewer
+    # than 3 are configured. NOTE: Groq DECOMMISSIONS model ids over time — the
+    # old llama3-70b-8192 / mixtral-8x7b-32768 / gemma2-9b-it are gone. These are
+    # clean instruct models (no reasoning-trace output) verified live 2026-07.
+    groq_api_key: str = ""
+    teacher_models: list[str] = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+    ]
+    groq_requests_per_minute: int = 30  # free-tier ceiling; paced client-side
 
     # Training Trigger
     training_trigger_dataset_size: int = 500
@@ -79,8 +93,37 @@ class Settings(BaseSettings):
     ab_min_hours: float = 48.0
     ab_pvalue_threshold: float = 0.05
     ab_cohens_d_threshold: float = 0.10
-    # Shadow quality scoring (replaces the old circular self-comparison metric)
-    shadow_scoring_strategy: Literal["reference_rouge", "llm_judge"] = "llm_judge"
+    # Hard ceiling on how long a challenger may sit in shadow. Without it a
+    # challenger that never accumulates ab_min_requests keeps the graph cycling
+    # ab_test_node -> END forever and the pipeline can never promote OR roll back.
+    # On timeout the window is force-decided; the promotion gate then rejects it
+    # for insufficient evidence and the pipeline returns to monitoring.
+    ab_max_wait_hours: float = 72.0
+    # Skip logs already handed to the detectors in an earlier cycle. The monitor
+    # queries a rolling 1h window every 60s, so without this each row is
+    # re-classified up to ~60 times (re-running NLI + embeddings) and the drift
+    # detector's rolling window is fed the same completions repeatedly. Keyed by
+    # log id rather than a timestamp cursor so backfilled rows are still seen.
+    # API authentication. Every control-plane endpoint (rollback, pause, model
+    # registry, audit trail, knowledge ingest) requires one of these keys;
+    # /health, /metrics and the sim endpoint stay open for probes and scrapes.
+    # Comma-separated so clients can be rotated independently. With auth enabled
+    # and no keys set, production fails closed and dev warns loudly.
+    api_auth_enabled: bool = True
+    api_keys: str = ""
+    log_dedup_enabled: bool = True
+    log_dedup_ttl_seconds: int = 7200
+    log_dedup_key: str = "pipeline:processed_log_ids"
+    # Master switch for the live shadow-observation hook that feeds shadow_logs.
+    shadow_observation_enabled: bool = True
+    # Dev/demo only: with no real challenger available (eval_real_inference off)
+    # the "challenger" echoes production, so deltas are ~0 and the gate will
+    # reject. It keeps the loop moving end-to-end; it does NOT produce a
+    # meaningful promotion decision. Never leave this on in production.
+    shadow_allow_stub_challenger: bool = True
+    # Shadow quality scoring (replaces the old circular self-comparison metric).
+    # $0 stack default: reference_rouge (ROUGE-L vs eval-set ground truth, no API).
+    shadow_scoring_strategy: Literal["reference_rouge", "llm_judge"] = "reference_rouge"
     shadow_reference_sim_threshold: float = 0.85
     shadow_judge_model: str = "gpt-4o-mini"
 
@@ -97,15 +140,34 @@ class Settings(BaseSettings):
     eval_lock_set_snapshot: bool = True
     eval_factory_evict_confidence_quartile: float = 0.25  # evict lowest-conf first (#E3)
 
-    # Safety gate fail-closed (#E1): in production a real safety classifier
-    # (Llama Guard) is REQUIRED — if it's unavailable the battery treats responses
-    # as unsafe (blocking promotion) instead of silently using brittle keywords.
-    safety_require_classifier: bool = True   # enforced only in production
+    # Safety gate fail-closed (#E1). $0 stack: the local toxicity classifier has
+    # no API to be "unavailable", and if the model download fails we fall back to
+    # the hardened keyword heuristic rather than blocking the pipeline — so this
+    # defaults False. Set True (with llama_guard) for paid-tier fail-closed.
+    safety_require_classifier: bool = False   # enforced only in production
     safety_max_tokens_after_refusal: int = 50  # content past a refusal phrase ⇒ unsafe
 
     # Detection
     hallucination_threshold: float = 0.50  # NLI: flag if mean non-entailment > this
-    drift_mahalanobis_threshold: float = 0.15
+    # When True, only flag hallucination for calls that had real grounding context
+    # (premise_source="context"). NLI against the PROMPT is unreliable for plain
+    # QA — a question rarely textually entails its answer, so prompt-premise
+    # scoring flags nearly every non-RAG answer as a hallucination. Default False
+    # to preserve behaviour; enable where traffic is mostly non-RAG.
+    hallucination_require_context: bool = False
+    # Drift score is dimension-NORMALIZED Mahalanobis (see DriftDetector.score):
+    # an in-distribution point scores ~1.0, so this threshold is a ratio-of-
+    # expected. 1.5 = fire when the rolling mean is 50% beyond a typical
+    # in-distribution point. (The old 0.15 was for raw high-dim distance and was
+    # unreachably small — drift fired on everything.)
+    drift_mahalanobis_threshold: float = 1.5
+    # Covariance shrinkage for the drift baseline (Ledoit-Wolf-style). A baseline
+    # built from low-diversity text (near-zero variance in many embedding dims)
+    # yields a near-singular covariance whose inverse explodes, making Mahalanobis
+    # distances hundreds-large and firing drift on everything. Shrinking the
+    # covariance toward a scaled identity conditions it so distances stay sane.
+    # 0 = no shrinkage (old behaviour); ~0.1 is a robust default.
+    drift_covariance_shrinkage: float = 0.1
     drift_baseline_min_samples: int = 500
     refusal_rate_multiplier: float = 2.0
     format_kl_threshold: float = 0.5
@@ -169,8 +231,17 @@ class Settings(BaseSettings):
     # ROUGE-L surface overlap, so paraphrases of the same answer count as agreement
     # and divergent meanings don't. Cosine sits lower than ROUGE for paraphrases,
     # hence a dedicated (slightly lower) threshold.
-    teacher_semantic_consistency_threshold: float = 0.80
+    # MiniLM cosine across the votes. Correct paraphrases of one answer cluster
+    # around ~0.79-0.85, so 0.80 sat right on that boundary and dropped genuinely-
+    # consistent corrections; 0.75 keeps them while still rejecting divergent votes.
+    teacher_semantic_consistency_threshold: float = 0.75
     teacher_consistency_temperature: float = 0.7  # >0 so self-consistency votes differ
+    # Minimum NLI entailment of a correction by its grounding context to accept it.
+    # Grounding is scored as the mean sentence-level entailment, so conversational
+    # filler ("Let me know if you need more!") in a verbose correction drags the
+    # mean down. The teacher prompt now forces terse factual answers; this stays
+    # configurable so a deployment can trade strictness for yield.
+    teacher_grounding_threshold: float = 0.50
     max_concurrent_teacher_calls: int = 20
     curation_cost_budget_usd: float = 25.0  # Per-run circuit breaker
     # OpenAI rate-limit resilience: retry 429 / timeout / connection errors with
@@ -187,8 +258,12 @@ class Settings(BaseSettings):
     quality_rouge_threshold: float = 0.30
     pii_fail_closed: bool = True
 
-    # Safety classifier
-    safety_classifier: Literal["llama_guard", "keyword_fallback"] = "llama_guard"
+    # Safety classifier. $0 default: a local HuggingFace toxicity model on CPU
+    # (~100ms/response, no API key). llama_guard (Together API) remains available
+    # for paid deployments; keyword_fallback is the hardened last resort.
+    safety_classifier: Literal["local_toxicity", "llama_guard", "keyword_fallback"] = "local_toxicity"
+    safety_toxicity_model: str = "unitary/toxic-bert"
+    safety_toxicity_threshold: float = 0.5  # classifier score above this ⇒ unsafe
     together_api_key: str = ""
     llama_guard_model: str = "meta-llama/Meta-Llama-Guard-3-8B"
 
@@ -267,6 +342,31 @@ class Settings(BaseSettings):
     # Modal
     modal_token_id: str = ""
     modal_token_secret: str = ""
+    # Training backend selection. "modal" = Modal A100 (primary), with the Colab
+    # webhook as a fallback when a Modal submit fails. "colab" = Colab-PRIMARY: no
+    # Modal at all — the dataset is inlined into the webhook POST, Colab trains on
+    # a free T4 and pushes the adapter to the HF Hub, and the pipeline POLLS the
+    # Hub for the adapter to appear (the laptop is behind NAT, so no callback).
+    training_backend: Literal["modal", "colab"] = "modal"
+    # Training fallback ($0 stack): Modal's $30/month free credits cover ~12h of
+    # A100 time. If a submit fails (credits exhausted / auth error), the pipeline
+    # can ping a Google Colab webhook (ngrok endpoint running
+    # scripts/colab_fallback_trainer.py on a free T4) instead of hard-failing.
+    modal_use_free_credits: bool = True
+    colab_webhook_url: str = ""  # empty ⇒ fallback just logs a loud warning
+    # How long the Hub-poll waits for the Colab-trained adapter before giving up.
+    colab_poll_timeout_hours: float = 3.0
+
+    # Synthetic traffic simulator (scripts/traffic_simulator.py --mode http).
+    # Mounts a no-op POST /sim/llm-call endpoint the interceptor middleware can
+    # capture. Test/demo only — never enable in production. Off by default.
+    sim_traffic_enabled: bool = False
+
+    # HuggingFace Hub artifact storage (free, unlimited adapter storage).
+    # When hf_token is set, train_lora also pushes the adapter to
+    # f"{hf_hub_repo_prefix}-{version_tag}" so artifacts survive outside Modal.
+    hf_token: str = ""
+    hf_hub_repo_prefix: str = ""  # e.g. "yourname/finetuning-adapter"
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -275,7 +375,7 @@ class Settings(BaseSettings):
             v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
         return v
 
-    @field_validator("lora_target_modules", mode="before")
+    @field_validator("lora_target_modules", "teacher_models", mode="before")
     @classmethod
     def parse_target_modules(cls, v: object) -> list[str]:
         if isinstance(v, str):

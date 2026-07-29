@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Any
 from sqlalchemy import select, update
@@ -97,6 +98,29 @@ class ModelRepository:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def get_by_tag(self, version_tag: str) -> ModelVersion | None:
+        result = await self._db.execute(
+            select(ModelVersion).where(ModelVersion.version_tag == version_tag)
+        )
+        return result.scalar_one_or_none()
+
+    async def next_version_tag(self) -> str:
+        """Next free vN tag, derived from the HIGHEST version ever created.
+
+        Deriving it from the *production* version instead was a correctness bug:
+        a rollback leaves the failed version row in place (only `rolled_back_at`
+        is set) while production stays at the older tag, so the next run
+        recomputed the same tag and `create_version` hit the UNIQUE constraint on
+        `version_tag`. Scanning all tags means a rolled-back v8 is never reissued.
+        """
+        result = await self._db.execute(select(ModelVersion.version_tag))
+        highest = 0
+        for (tag,) in result.fetchall():
+            match = re.fullmatch(r"v(\d+)", (tag or "").strip())
+            if match:
+                highest = max(highest, int(match.group(1)))
+        return f"v{highest + 1}"
 
     async def get_version_history(self, limit: int = 20) -> list[ModelVersion]:
         result = await self._db.execute(

@@ -46,12 +46,18 @@ class PromotionGate:
                 metrics={"safety_score": eval_result.safety_score},
             )
 
-        # Gate 2: A/B window must be complete
+        # Gate 2: A/B window must be complete. A timed-out window reaches here
+        # too (ab_test_node forces a decision so the graph can't hang); it is
+        # rejected for insufficient evidence, just under a clearer reason.
         if not ab_data.get("ready"):
+            label = (
+                "ab_window_timed_out" if ab_data.get("timed_out")
+                else "ab_window_incomplete"
+            )
             return PromotionDecision(
                 promote=False,
                 reason=(
-                    f"ab_window_incomplete: "
+                    f"{label}: "
                     f"requests={ab_data.get('n_requests', 0)}, "
                     f"hours={ab_data.get('elapsed_hours', 0):.1f}"
                 ),
