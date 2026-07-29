@@ -132,9 +132,13 @@ class FailureClassifier:
             completion = event.get("completion", "")
             candidates: list[FailureEvent] = []
 
-            # Hallucination
+            # Hallucination. NLI against the bare prompt is an unreliable signal
+            # for non-RAG QA (a question doesn't entail its answer), so optionally
+            # require real grounding context before flagging.
             hall_score = hall_scores[i] if i < len(hall_scores) else 0.0
-            if hall_score > settings.hallucination_threshold:
+            hall_has_context = premise_sources[i] == "context"
+            hall_gated = hall_has_context or not settings.hallucination_require_context
+            if hall_gated and hall_score > settings.hallucination_threshold:
                 candidates.append(FailureEvent(
                     llm_log_id=log_id, prompt=prompt, completion=completion,
                     failure_type="hallucination", score=hall_score,

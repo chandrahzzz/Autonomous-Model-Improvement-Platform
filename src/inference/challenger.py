@@ -18,6 +18,7 @@ tests cover the verification contract with injected fns.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from typing import Awaitable, Callable
 
 import structlog
@@ -62,14 +63,30 @@ class HFModelRunner:
         tokenizer = AutoTokenizer.from_pretrained(self._base_model, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(
-            self._base_model,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+        # 4-bit NF4 when a CUDA GPU is present (bitsandbytes is CUDA-only);
+        # on CPU fall back to full precision — slower but functional, which is
+        # what a $0 eval box (Oracle free-tier ARM, student laptop) needs.
+        load_kwargs: dict = {"trust_remote_code": True}
+        if torch.cuda.is_available():
+            try:
+                from transformers import BitsAndBytesConfig
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+                load_kwargs["device_map"] = "auto"
+            except Exception:
+                load_kwargs["torch_dtype"] = torch.float16
+                load_kwargs["device_map"] = "auto"
+        else:
+            load_kwargs["torch_dtype"] = torch.float32
+        model = AutoModelForCausalLM.from_pretrained(self._base_model, **load_kwargs)
         if self._lora_weights_path:
             from peft import PeftModel
+            # Accepts a local dir, a Modal-volume mount path, OR a HuggingFace
+            # Hub repo id ("user/finetuning-adapter-v8") — from_pretrained
+            # resolves all three, so Hub-stored adapters need no special casing.
             model = PeftModel.from_pretrained(model, self._lora_weights_path)
             # Bake the adapter into the base weights so generation reflects it and
             # there is no adapter-routing ambiguity at inference time.
@@ -111,12 +128,35 @@ class HFModelRunner:
         return await loop.run_in_executor(None, self._generate_sync, prompt)
 
 
+# Merged-model cache: shadow traffic and repeated eval calls must not reload
+# (and re-merge) a multi-GB model per request. Bounded to the two variants a
+# cycle actually needs (base + current challenger); a new challenger version
+# evicts the oldest entry.
+_RUNNER_CACHE: OrderedDict[tuple[str, str | None], HFModelRunner] = OrderedDict()
+_RUNNER_CACHE_MAX = 2
+
+
+def get_runner(base_model: str, lora_weights_path: str | None = None) -> HFModelRunner:
+    """LRU-cached HFModelRunner per (base, adapter) pair."""
+    key = (base_model, lora_weights_path)
+    runner = _RUNNER_CACHE.get(key)
+    if runner is None:
+        runner = HFModelRunner(base_model, lora_weights_path=lora_weights_path)
+        _RUNNER_CACHE[key] = runner
+        while len(_RUNNER_CACHE) > _RUNNER_CACHE_MAX:
+            evicted_key, _ = _RUNNER_CACHE.popitem(last=False)
+            log.info("challenger_runner_evicted", key=str(evicted_key))
+    else:
+        _RUNNER_CACHE.move_to_end(key)
+    return runner
+
+
 def build_base_invoke_fn(base_model: str) -> InvokeFn:
-    return HFModelRunner(base_model, lora_weights_path=None).invoke
+    return get_runner(base_model, lora_weights_path=None).invoke
 
 
 def build_challenger_invoke_fn(base_model: str, lora_weights_path: str) -> InvokeFn:
-    return HFModelRunner(base_model, lora_weights_path=lora_weights_path).invoke
+    return get_runner(base_model, lora_weights_path=lora_weights_path).invoke
 
 
 async def verify_adapter_distinct(

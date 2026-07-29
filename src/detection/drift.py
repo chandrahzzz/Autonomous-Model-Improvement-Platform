@@ -27,6 +27,31 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 WINDOW_SIZE = 1000
 
 
+def _condition_covariance(cov: np.ndarray, shrinkage: float) -> np.ndarray:
+    """Condition a (possibly near-singular) covariance so its inverse is stable.
+
+    Ledoit-Wolf-style shrinkage toward a scaled identity target:
+        Σ' = (1 - λ)·Σ + λ·mean_var·I
+    plus a variance floor on the diagonal. Low-diversity baselines (e.g. templated
+    text) have near-zero variance in many embedding dimensions, making Σ singular
+    and Mahalanobis distances explode; shrinking toward the average-variance
+    identity keeps distances sane without discarding the correlation structure.
+    """
+    cov = np.atleast_2d(np.asarray(cov, dtype=float))
+    d = cov.shape[0]
+    mean_var = float(np.trace(cov) / d) if d else 1.0
+    if mean_var <= 0:
+        mean_var = 1.0
+    lam = float(min(max(shrinkage, 0.0), 1.0))
+    if lam > 0:
+        cov = (1.0 - lam) * cov + lam * mean_var * np.eye(d)
+    # Floor the diagonal so no single dimension has ~zero variance.
+    floor = max(mean_var * 1e-3, 1e-6)
+    diag = np.diag(cov).copy()
+    np.fill_diagonal(cov, np.maximum(diag, floor))
+    return cov
+
+
 def _parse_dt(raw: str | None) -> datetime | None:
     if not raw:
         return None
@@ -80,8 +105,10 @@ class DriftDetector:
         embeddings = self._encoder.encode(texts, batch_size=64, show_progress_bar=True)
         centroid = np.mean(embeddings, axis=0)
         cov = np.cov(embeddings.T)
-        cov += np.eye(cov.shape[0]) * 1e-6   # regularize for numerical stability
-        cov_inv = np.linalg.inv(cov)
+        cov = _condition_covariance(cov, settings.drift_covariance_shrinkage)
+        # pinv (not inv) is stable even if the conditioned matrix is still close to
+        # singular — it never raises and degrades gracefully.
+        cov_inv = np.linalg.pinv(cov)
         return {
             "centroid": centroid.tolist(),
             "covariance_inv": cov_inv.tolist(),
@@ -129,15 +156,25 @@ class DriftDetector:
 
     def score(self, text: str) -> float:
         """
-        Returns Mahalanobis distance for one output. 0.0 if baseline not loaded.
-        Appends to rolling window for trend detection.
+        Returns a DIMENSION-NORMALIZED Mahalanobis distance for one output, or 0.0
+        if the baseline isn't loaded. Appends to the rolling window.
+
+        Raw Mahalanobis distance in a d-dim embedding space is ~sqrt(d) for any
+        in-distribution point (mahalanobis² ~ chi-squared with d dof), so for
+        MiniLM's 384 dims a normal point scores ~20 — which made the old absolute
+        threshold (0.15) meaningless and fired drift on everything. Dividing by
+        sqrt(d) makes the score dimension-independent: an in-distribution point
+        scores ~1.0 and a drifted one scores higher, so the threshold is a simple
+        ratio-of-expected (e.g. 1.5 = 50% beyond a typical in-distribution point).
         """
         if not self._loaded or self._centroid is None or self._cov_inv is None:
             return 0.0
 
         embedding = self._encoder.encode([text])[0]
         try:
-            dist = float(mahalanobis(embedding, self._centroid, self._cov_inv))
+            raw = float(mahalanobis(embedding, self._centroid, self._cov_inv))
+            d = len(self._centroid)
+            dist = raw / np.sqrt(d) if d > 0 else raw
         except Exception:
             dist = 0.0
 

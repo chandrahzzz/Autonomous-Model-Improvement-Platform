@@ -1,5 +1,6 @@
-# Local dev overrides — not committed to production
-version: "3.9"
+# Local dev overrides — not committed to production.
+# (Redpanda replaced Kafka+Zookeeper; the base compose already advertises
+# PLAINTEXT://localhost:9092, so no broker override is needed here.)
 
 services:
   postgres:
@@ -11,7 +12,3 @@ services:
   redis:
     ports:
       - "6379:6379"
-
-  kafka:
-    environment:
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092

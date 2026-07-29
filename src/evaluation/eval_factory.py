@@ -198,8 +198,10 @@ class EvalFactory:
             "just give the ideal answer a knowledgeable person would give."
         )
         try:
+            # Client is AsyncGroq in the $0 stack (identical interface to
+            # AsyncOpenAI); the model comes from settings so both work.
             response = await self._openai.chat.completions.create(
-                model="gpt-4o",
+                model=settings.teacher_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},

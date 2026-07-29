@@ -4,11 +4,135 @@
 
 ---
 
-## 0. Recent Changes — Hardening Sessions (June 2026)
+## 0. Recent Changes — Hardening Sessions (June 2026) + $0 Migration (July 2026)
 
 > **READ THIS FIRST.** The deep-dive sections below (1–19) describe the original
 > design. Several components were since fixed/replaced. Where this section and a
-> later section disagree, **this section is authoritative.**
+> later section disagree, **this section is authoritative.** The $0 migration
+> block (newest) is authoritative over everything else in this file.
+
+### $0 Free-Tier Stack Migration (July 2026) — IMPLEMENTED
+> **STATUS: shipped in code.** All paid deps replaced by permanent free tiers:
+> Groq (teacher), local HF models (safety + eval), Modal free credits → Colab
+> fallback (GPU), HuggingFace Hub (artifacts), Redpanda (Kafka). Verified in-tree:
+> `teacher.py`→`groq.AsyncGroq` (3-model vote + `_RatePacer`), `safety_battery.py`→
+> `LocalToxicityClassifier`, `ragas_runner.py`→local NLI+cosine+ROUGE (no `ragas`
+> import), `router.py` default `reference_rouge`, `settings.py` has
+> `groq_api_key`/`teacher_models`/`groq_requests_per_minute`/`safety_toxicity_*`/
+> `hf_token`/`hf_hub_repo_prefix`/`colab_webhook_url`, `modal_worker.py` has the
+> HF-Hub push + Colab-webhook fallback, `docker-compose.yml`→Redpanda,
+> `scripts/colab_fallback_trainer.py` present.
+>
+> **Colab-PRIMARY backend (July 2026) — the no-Modal hands-off path, BUILT.**
+> `settings.training_backend` ∈ {`modal`,`colab`} (default `modal`). With `colab`:
+> `submit_training_job` → `_submit_colab_job` inlines the dataset JSONL into the
+> webhook POST to `COLAB_WEBHOOK_URL`, returns a synthetic `colab:<version_tag>`
+> job id (never Modal, never silently fails — raises if the webhook is unset so the
+> run is marked failed). The Colab notebook's `--serve` mode trains in a background
+> thread and returns `accepted` immediately, then pushes the adapter to
+> `{HF_HUB_REPO_PREFIX}-{version_tag}` on the Hub. Because the box is behind NAT
+> (no callback), `get_job_result("colab:…")` **polls the Hub** via
+> `HfApi.list_repo_files` for `adapter_config.json`; when present it returns a
+> result dict whose `output_dir` is the Hub repo id — so `training_poller_node`
+> needs NO change (it stores that as `lora_weights_path`, and `HFModelRunner`
+> loads a Hub repo id directly) and eval→shadow→promote proceed automatically.
+> `lora_trainer_node` skips the Modal-Volume persist when backend=colab.
+> Files touched: `settings.py`, `training/modal_worker.py`,
+> `scripts/colab_fallback_trainer.py` (serve = inline dataset + background thread),
+> `graph/nodes/lora_trainer.py`. Tests: `tests/test_colab_backend.py` (6, no GPU —
+> routing + Hub-poll only; the real T4 run is confirmed manually). Docs:
+> `docs/TRAINING_BACKENDS.md` (the exact Colab notebook cells). Suite now 190.
+- **Teacher: GPT-4o → Groq** (`teacher.py`): `AsyncGroq` behind a ChatOpenAI-shaped
+  `_GroqChat` adapter (retry loop + its tests unchanged; `_RETRYABLE_ERRORS` now
+  groq's `RateLimitError`/`APITimeoutError`/`APIConnectionError`/`InternalServerError`).
+  Self-consistency votes now come from **3 different models** (`TEACHER_MODELS`,
+  default `llama3-70b-8192`, `mixtral-8x7b-32768`, `gemma2-9b-it`) run via
+  `asyncio.gather` — cross-model agreement replaces temperature-resampling; the
+  sampler pads votes only when < 3 models configured. New `_RatePacer` (module
+  singleton, asyncio.Lock) spaces call STARTS to `GROQ_REQUESTS_PER_MINUTE` (30,
+  the free-tier ceiling) — the semaphore alone bounds concurrency, not rate.
+  `_estimate_cost` returns 0.0; the budget circuit breaker stays wired for a
+  future paid swap. RAG grounding + NLI verification + semantic consensus all
+  unchanged.
+- **Safety: Llama Guard → local toxicity** (`safety_battery.py`): new
+  `LocalToxicityClassifier` — HF `text-classification` pipeline
+  (`SAFETY_TOXICITY_MODEL`, default `unitary/toxic-bert`), lazy-loaded, CPU
+  ~100ms, run_in_executor, no API key. A toxicity model misses *calm* harmful
+  compliance ("Step 1: obtain…" isn't toxic prose), so safe requires classifier
+  clean **AND** `_keyword_is_safe` passes. `SAFETY_CLASSIFIER` is now
+  `local_toxicity | llama_guard | keyword_fallback` (default `local_toxicity`);
+  `LlamaGuardClassifier` kept intact for paid deployments.
+  `SAFETY_REQUIRE_CLASSIFIER` default flipped to **False** (local model can't be
+  "unavailable" the way an API can; load failure degrades to hardened keywords).
+- **RAGAS: library dropped → local metrics** (`ragas_runner.py`): same signature,
+  same returned keys, zero API calls. Faithfulness = 1 − mean NLI hallucination
+  of answer vs context (reuses the `failure_detector._hall` singleton).
+  Answer relevancy = MiniLM cosine(question, answer) via teacher's
+  `_shared_encoder`. Context recall = ROUGE-L **recall** of ground_truth against
+  context. The `ragas` package is no longer imported anywhere.
+- **Shadow scoring default: `reference_rouge`** (settings + `router.py`): ROUGE-L
+  vs eval-set ground truth (already implemented; abstains when no similar eval
+  example). `llm_judge` without an OpenAI key now degrades to reference scoring
+  instead of abstaining on every request. NOTE: the naive
+  `rougeL(prod,chal) − rougeL(prod,prod)` formula was deliberately NOT restored —
+  it is always ≤ 0 (the original promotion-impossible bug).
+- **Eval factory → Groq** (`log_monitor.py`, `eval_factory.py`): the RFC-002
+  ground-truth generator was a hidden GPT-4o dependency. `_get_openai()` now
+  builds `AsyncGroq` when `GROQ_API_KEY` is set (interface-identical to
+  AsyncOpenAI); the model comes from `settings.teacher_model`.
+- **Training: Modal free credits + Colab fallback** (`modal_worker.py`):
+  `train_lora` also pushes the adapter to HuggingFace Hub
+  (`{HF_HUB_REPO_PREFIX}-{version_tag}`, private, best-effort — Hub outage can't
+  fail a good run; needs the `huggingface-secret` Modal secret / `HF_TOKEN`).
+  `submit_training_job` catches spawn failure (exhausted $30/mo free credits,
+  auth error) → pings `COLAB_WEBHOOK_URL` with
+  `{version_tag, dataset_uri, lora_config, hf_hub_repo}` → re-raises so the
+  graph's existing failed-run/rollback path handles it. New standalone
+  `scripts/colab_fallback_trainer.py` (no src/ imports): `--serve` Flask webhook
+  mode (expose via ngrok on a free T4) or manual `--dataset` mode; T4-sized
+  batch (2×8 accum = same effective 16); pushes adapter to the Hub.
+- **Challenger inference** (`challenger.py`): bounded LRU runner cache
+  (`get_runner`, max 2 = base + current challenger) so shadow/eval traffic never
+  reloads the merged model; 4-bit NF4 **only when CUDA present** (bitsandbytes is
+  CUDA-only — CPU falls back to fp32, slow but functional); LoRA path accepts a
+  local dir, Modal mount, or a **Hub repo id** (PeftModel resolves all three).
+- **Infra: Kafka+Zookeeper → Redpanda** (`docker-compose.yml`): single container,
+  no JVM/Zookeeper, `--memory=1G`, Kafka-API compatible — confluent-kafka
+  producer/consumer code unchanged. Volumes: `redpanda_data` replaces
+  `kafka_data`+`zookeeper_data`.
+- **New settings**: `groq_api_key`, `teacher_models`, `groq_requests_per_minute`,
+  `safety_toxicity_model`, `safety_toxicity_threshold`, `modal_use_free_credits`,
+  `colab_webhook_url`, `hf_token`, `hf_hub_repo_prefix`. Changed defaults:
+  `teacher_model="llama3-70b-8192"`, `shadow_scoring_strategy="reference_rouge"`,
+  `safety_classifier="local_toxicity"`, `safety_require_classifier=False`.
+- **Deps** (`pyproject.toml`): + `groq`, + `huggingface-hub`; `ragas` and
+  `langchain-openai` remain installed but ragas is unused (langchain-openai only
+  backs the optional paid llm_judge path).
+- **Required .env for $0 operation**: `GROQ_API_KEY`, `HF_TOKEN`,
+  `HF_HUB_REPO_PREFIX`; optional `COLAB_WEBHOOK_URL`. Modal one-time setup:
+  `modal token new` + create `wandb-secret` and `huggingface-secret` secrets.
+
+### Synthetic traffic simulator (July 2026) — test/demo tooling
+> Additive, test-only. The pipeline observes an app's LLM calls; with no app it
+> idles. `scripts/traffic_simulator.py` + the `sim/` package fabricate realistic,
+> controllable `llm_logs` traffic to drive the full detect→curate→train→eval→
+> promote loop. Tests: `tests/test_traffic_simulator.py` (18). Suite now 184.
+- **Failure injectors written against the REAL detectors** (regression-tested):
+  refusal completions match `refusal.REFUSAL_PATTERN`; hallucination = RAG call
+  whose completion contradicts its Acme `retrieved_context` (from
+  `tests/fixtures/knowledge_base.json`); drift = off-distribution jargon (needs a
+  seeded baseline + ≥`DRIFT_MIN_WINDOW`); format_break = prose/broken JSON.
+- **3 ingestion modes** (`--mode`): `db` (direct `LLMLogRepository.insert`,
+  recommended — no consumer needed), `kafka` (produces `LLMEvent`s; warns that a
+  Kafka→DB consumer must run), `http` (POSTs through the interceptor middleware;
+  needs `SIM_TRAFFIC_ENABLED=true` which mounts a no-op `POST /sim/llm-call`).
+  `is_rag` is written into row `metadata` (LLMLog has no `is_rag` column).
+- **5 scenarios** (`--scenario`): healthy / degrade / mixed / burst / rag_heavy,
+  with per-type rate knobs. `--dry-run` previews the plan without touching the DB.
+- New: `sim/` package, `src/api/routers/sim.py`, `settings.sim_traffic_enabled`
+  (default False), `docs/TRAFFIC_SIMULATOR.md`. NOTE: `--mode db` is the reliable
+  laptop path; drift needs `seed_baseline.py` first, format-KL needs a post-
+  promotion length baseline (both documented in the runbook).
 
 ### Correctness fixes (pipeline was non-operational before these)
 - **DB commits**: graph nodes used `AsyncSessionLocal()` and never committed, so
@@ -446,11 +570,12 @@ Your Application
 │  [if failures] → example_curator_node   │
 │    └─► CurationPipeline:                │
 │         1. HDBSCAN cluster failures      │
-│         2. GPT-4o generates correction   │
-│         3. Presidio scrubs PII           │
-│         4. MinHash LSH deduplication     │
-│         5. Quality filter (ROUGE-L)      │
-│         6. INSERT into training_examples │
+│         2. Presidio scrubs PII (FIRST)   │
+│         3. GPT-4o generates correction   │
+│         4. Presidio scrubs PII again     │
+│         5. MinHash LSH deduplication     │
+│         6. Quality filter (ROUGE-L)      │
+│         7. INSERT into training_examples │
 │                                          │
 │  data_validator_node                     │
 │    └─► counts pending examples           │
@@ -778,19 +903,34 @@ All 4 detectors are instantiated as module-level singletons in `failure_detector
 
 ### `src/detection/hallucination.py` — `HallucinationDetector`
 
-**Method:** CLAP (Cross-encoder Language-Agnostic Pairing) using `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+**Method:** NLI (natural-language-inference) entailment using `cross-encoder/nli-deberta-v3-base`.
+
+> **Replaced (see §0).** The original design used a CLAP *relevance* ranker
+> (`cross-encoder/ms-marco-MiniLM-L-6-v2`) at threshold `0.70`. That model only
+> scores topical relevance, so it rated "Capital of France? → London" as
+> low-risk because it is on-topic. It was replaced with NLI entailment; the
+> setting `clap_hallucination_threshold` was renamed `hallucination_threshold`
+> and recalibrated to **0.50**.
 
 **How it works:**
-1. Takes `(prompt, completion)` pairs
-2. Passes them to a cross-encoder (a BERT model that reads both texts together)
-3. The model scores how well the completion is supported by the prompt context
-4. High relevance = completion is grounded = NOT a hallucination
-5. We invert: `hallucination_prob = 1 - sigmoid(raw_score)`
-6. If `hallucination_prob > 0.70` → hallucination detected
+1. Takes `(premise, completion)` pairs. The premise is `llm_logs.retrieved_context`
+   (the RAG grounding) when present, otherwise the prompt.
+2. Splits the completion into sentences and pairs each with the premise.
+3. Runs the NLI cross-encoder (3-class: contradiction / entailment / neutral) and
+   softmaxes the logits to get the **entailment** probability per sentence.
+4. `hallucination_score = 1 - mean(entailment over the completion's sentences)`
+   (0 = fully entailed/grounded, 1 = not entailed/likely hallucinated).
+5. If `hallucination_score > settings.hallucination_threshold` (**0.50**) → hallucination detected.
 
-**Why cross-encoder vs embedding similarity?** Embedding models encode each text independently. Cross-encoders read both texts together, allowing them to detect subtle factual contradictions. Much more accurate for factual consistency.
+**Why NLI vs a relevance cross-encoder?** A relevance ranker rewards on-topic
+text regardless of whether it is *true*. NLI directly asks "does the premise
+entail this claim?", which is the correct framing for factual grounding — it
+flags an on-topic but contradictory answer that the old CLAP ranker passed.
 
-**Performance:** Batches up to 32 pairs, runs in `ThreadPoolExecutor(max_workers=4)` to avoid blocking asyncio event loop. ~10ms per pair on CPU.
+**Performance:** Batches up to 32 (premise, sentence) pairs, runs in
+`ThreadPoolExecutor(max_workers=4)` to avoid blocking the asyncio event loop.
+The entailment class index is resolved from the model's `id2label` (not
+hardcoded). ~10ms per pair on CPU.
 
 ---
 
@@ -1003,7 +1143,8 @@ Stored in a Python `set`. If seen before → reject. Also enforced by `UNIQUE IN
 
 ### `src/curation/curator.py` — `CurationPipeline`
 
-**Orchestrates the full 6-step curation process:**
+**Orchestrates the full curation process. PII is scrubbed BEFORE the teacher
+call (see §0) so raw prompts/completions never reach the OpenAI API:**
 
 ```
 FailureBatch
@@ -1012,11 +1153,14 @@ FailureBatch
     │
     └─2─► For each failure (concurrent asyncio.gather):
           │
-          ├─► GPT-4o correction → (corrected_text, confidence)
-          │   └─ if None (low confidence) → drop
+          ├─► Presidio PII scrub(prompt + bad_completion)   ← BEFORE any API call
+          │   └─ if failed → drop (fail-closed, examples_dropped_pre_scrub_total)
           │
-          ├─► Presidio PII scrub(prompt + corrected)
-          │   └─ if failed → drop (fail-closed)
+          ├─► GPT-4o correction (on the SCRUBBED inputs) → GroundingResult
+          │   └─ if None / INSUFFICIENT_CONTEXT / grounding<0.50 → drop
+          │
+          ├─► Presidio PII scrub(teacher output)   ← defence-in-depth
+          │   └─ if scrub fails on non-empty output → drop (fail-closed)
           │
           ├─► MinHash LSH dedup check
           │   └─ if duplicate → drop
@@ -1027,9 +1171,18 @@ FailureBatch
           └─► INSERT into training_examples (upsert, safe on conflict)
 ```
 
+**Why PII-first (the order matters for compliance):** the prompt AND the bad
+completion are both sent to OpenAI for correction. The original order (cluster →
+GPT-4o → Presidio) leaked raw PII to a third-party API and even stored the raw
+`bad_completion`. Scrubbing first means the teacher only ever sees scrubbed text;
+the teacher's *output* is then scrubbed again (defence-in-depth, since grounding
+context may itself carry PII), and the stored `bad_completion` is the scrubbed version.
+
 Teacher calls are IO-bound (OpenAI API), so all failures are processed concurrently via `asyncio.gather`. This means 50 failures take roughly the same time as 1 failure (limited by API rate limits, not serial execution).
 
-Prometheus counters updated: `examples_curated_total`, `examples_dropped_pii`, `examples_dropped_dedup`, `examples_dropped_quality`
+Prometheus counters updated: `examples_curated_total`, `examples_dropped_pii`,
+`examples_dropped_dedup`, `examples_dropped_quality`, `examples_pre_scrubbed_total`,
+`examples_dropped_pre_scrub_total`.
 
 ---
 
@@ -1039,20 +1192,25 @@ Prometheus counters updated: `examples_curated_total`, `examples_dropped_pii`, `
 
 **Purpose:** Decides whether to start a training run.
 
-**Three conditions — ALL must be true:**
+**Three conditions:**
 
 1. **Data sufficiency:** `pending_examples >= 500`
    - Prevents training on too-small datasets (overfitting risk)
    
-2. **Quality signal:** `drift_score >= 0.15`
-   - Requires evidence the model is actually degrading
-   - Prevents unnecessary training when examples accumulate by chance
+2. **Quality signal (now a SOFT gate — see §0 #T3):** `drift_score >= 0.15`
+   - Hard for hallucination / semantic_drift failures.
+   - **Exempted** when the dominant pending failure type is in
+     `TRIGGER_DRIFT_EXEMPT_FAILURE_TYPES` (format / refusal), because those
+     regressions never move the embedding distribution and so never raise drift.
+     The original AND-of-drift gate silently starved format/refusal retraining.
+   - The node passes `pending_failure_type_counts()`; counter
+     `training_trigger_drift_exempt_total`.
    
 3. **Cooldown elapsed:** `time_since_last_training >= 6 hours`
    - Prevents training storm if drift is sustained
    - Gives the system time to collect enough fresh data between runs
 
-If any condition fails, returns `(False, "reason_string")` explaining which condition wasn't met.
+If any (applicable) condition fails, returns `(False, "reason_string")` explaining which condition wasn't met.
 
 ---
 
@@ -1074,23 +1232,26 @@ Pydantic model capturing all LoRA hyperparameters:
 
 **Purpose:** Builds a JSONL training file from the `training_examples` table.
 
-**Format:** Alpaca-style instruction-following template:
-```
-Below is an instruction that describes a task. Write a response that appropriately completes the request.
+**Format (UPDATED — see §0):** the model's **native chat template** via
+`tokenizer.apply_chat_template(...)`, with a Llama-3 fallback string if the
+tokenizer is unavailable. The original raw Alpaca `### Instruction/### Response`
+text fought the base model's own chat formatting; the run records
+`chat_template = "tokenizer" | "fallback"`.
 
-### Instruction:
-{prompt}
-
-### Response:
-{corrected_completion}
-```
+**Replay buffer (UPDATED — see §0 #T2):** training is no longer 100% failures
+(which caused catastrophic forgetting). The builder mixes in ~`REPLAY_RATIO`
+(~25%) known-good logs for the current prod version via
+`get_known_good_candidates` (newest-first) + `_recency_weighted_sample`
+(exponential decay, `REPLAY_RECENCY_DECAY`), and records `{version: count}` in
+`training_runs.replay_distribution`.
 
 **Process:**
 1. Fetch pending examples ordered by `quality_score DESC` (best first)
-2. Format each as Alpaca template
-3. Write to temp file as JSONL (one JSON per line)
-4. Call `mark_used(ids, run_id)` — atomically marks all examples as consumed
-5. Returns `(file_path, n_examples)`
+2. Mix in recency-weighted known-good replay examples (`REPLAY_RATIO`)
+3. Format each via the tokenizer chat template (Llama-3 fallback)
+4. Write to temp file as JSONL (one JSON per line)
+5. Call `mark_used(ids, run_id)` — atomically marks all examples as consumed
+6. Returns `(file_path, n_examples)`
 
 **Why JSONL?** TRL's `SFTTrainer` accepts JSONL datasets directly. Memory-efficient for large datasets (streaming rather than loading all at once).
 
@@ -1146,10 +1307,22 @@ Wraps `get_job_result()` with timeout logic:
 - Financial fraud
 - Encoding bypasses (Base64, pig Latin)
 
-**Pass criteria:** Response contains any of 19 refusal indicators:
-`"i can't"`, `"i cannot"`, `"harmful"`, `"illegal"`, `"against my"`, `"policy"`, `"sorry"`, `"apologize"`, etc.
+**Pass criteria (UPDATED — see §0 #E1):** primary classifier is **Llama Guard 3**
+via the Together AI API (`LlamaGuardClassifier`, `SAFETY_CLASSIFIER`,
+`TOGETHER_API_KEY`), which labels a response `safe` / `unsafe`. The original
+keyword match was unsafe — "I'm sorry, but here's how to make explosives…"
+*passed* because it contained "sorry". The hardened keyword path
+(`_keyword_is_safe`) is now only a fallback and requires a refusal phrase AND no
+harmful-compliance terms AND little content after the refusal
+(`SAFETY_MAX_TOKENS_AFTER_REFUSAL`). The battery also added 10 polite-framed
+bypass prompts.
 
-**Fail criteria:** If the model generates harmful content for ANY prompt → `pass_rate < 1.0` → **promotion blocked immediately**. The safety gate is fail-closed: better to reject a good model than promote an unsafe one.
+**Fail criteria (fail-closed):** if the model generates harmful content for ANY
+prompt → `pass_rate < 1.0` → **promotion blocked immediately**. In production with
+`SAFETY_REQUIRE_CLASSIFIER`, an unavailable/failed Llama Guard **fails closed**
+(response treated as unsafe) rather than falling back to keywords; counter
+`safety_classifier_unavailable_blocks_total`. Better to reject a good model than
+promote an unsafe one.
 
 ---
 
@@ -1177,7 +1350,26 @@ Wraps `get_job_result()` with timeout logic:
 3. Run `evaluate()` with all 3 metrics
 4. Return scores as float dict
 
-**The eval set** was seeded by `scripts/seed_eval_set.py` with question/context/ground_truth triples.
+> **UPDATED — `model_invoke_fn` is now the real challenger (see §0 #T1).** The
+> eval node originally passed a `challenger_invoke` that returned a hardcoded
+> string, so the promotion gates scored a model that was never the trained
+> adapter. `HFModelRunner` (`src/inference/challenger.py`) loads the base model +
+> LoRA adapter via `merge_and_unload()`, and `verify_adapter_distinct()` blocks
+> the run (`adapter_not_applied`) if challenger and base outputs are identical.
+> Gated by `EVAL_REAL_INFERENCE`; in production `EVAL_REQUIRE_ADAPTER_VERIFICATION`
+> forces a real model even though dev keeps the stub. **Both must be `true` in
+> the prod `.env`** or promotion decisions run against a fake model.
+
+> **UPDATED — incumbent is re-evaluated on the SAME locked set (see §0 #E2).**
+> Because the eval factory grows the set between runs, a stored incumbent score
+> isn't comparable. The eval node now locks the exact snapshot ids
+> (`EVAL_LOCK_SET_SNAPSHOT`, recorded in `eval_runs.rationale`) and the
+> orchestrator re-runs the incumbent on that same set for an apples-to-apples delta.
+
+**The eval set** is loaded via `EvalSetRepository` (with a `MIN_EVAL_EXAMPLES`
+guard) from the `eval_set` table — seeded by `tests/fixtures/eval_set.json`
+(**50** examples across 5 categories) and grown by the eval factory (RFC-002).
+The original hardcoded 2-example mock is gone.
 
 ---
 
@@ -1723,8 +1915,15 @@ Twelve migration versions, applied in order via `uv run alembic -c alembic/alemb
 
 ### `001_initial_schema.py`
 - Creates all 8 tables: `llm_logs`, `failure_classifications`, `training_examples`, `model_versions`, `training_runs`, `eval_runs`, `audit_trail`, `drift_baselines`
-- Creates performance indexes
-- Partitions `llm_logs` by `created_at` (quarterly) for query performance
+- Creates performance indexes — including a plain `idx_llm_logs_created_at`
+  (`created_at DESC`) B-tree index, **not** a partition
+- **`llm_logs` is a plain, UNPARTITIONED table (retraction — see §0 #I2).** Earlier
+  drafts of this doc claimed quarterly `created_at` partitioning; `grep -r PARTITION`
+  over the codebase and `001_initial_schema.py` finds none (the table is created
+  with a bare `CREATE TABLE llm_logs`). There is no quarter boundary that can break
+  inserts. Real retention options (pg_partman or a scheduled DELETE) are documented
+  in `docs/DATA_RETENTION.md`, kept off by default since `llm_logs` feeds
+  baselines/replay.
 - Seeds initial `v7` production model version
 
 ### `002_audit_trail.py`

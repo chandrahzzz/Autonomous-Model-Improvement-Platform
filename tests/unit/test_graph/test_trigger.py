@@ -5,6 +5,16 @@ from datetime import datetime, timedelta
 from src.training.trigger import TrainingTrigger
 
 
+@pytest.fixture(autouse=True)
+def _pin_trigger_thresholds(monkeypatch):
+    """Pin the thresholds these tests assert so they don't inherit ambient .env
+    overrides (e.g. a demo .env that lowers the dataset size / cooldown)."""
+    from src.config.settings import settings
+    monkeypatch.setattr(settings, "training_trigger_dataset_size", 500)
+    monkeypatch.setattr(settings, "training_trigger_drift_threshold", 0.15)
+    monkeypatch.setattr(settings, "training_min_interval_hours", 6)
+
+
 @pytest.fixture
 def trigger():
     return TrainingTrigger()
