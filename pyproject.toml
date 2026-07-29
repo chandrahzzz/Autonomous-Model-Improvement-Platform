@@ -36,8 +36,12 @@ dependencies = [
     "accelerate>=0.30.0",
     "modal>=0.62.0",
 
-    # Evaluation
-    "ragas>=0.1.9",
+    # Teacher ($0 stack — Groq free tier)
+    "groq>=0.9.0",
+
+    # Evaluation (RAGAS metrics are computed locally; the ragas package is no
+    # longer imported — huggingface_hub is for free adapter storage)
+    "huggingface-hub>=0.23.0",
     "wandb>=0.17.0",
 
     # Detection
@@ -102,3 +106,6 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=src --cov-report=term-missing --cov-report=html"
+markers = [
+    "realdb: requires a live PostgreSQL (docker compose up -d postgres). Auto-skips when unreachable.",
+]
