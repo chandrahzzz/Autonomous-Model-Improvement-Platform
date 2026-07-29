@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 import structlog
@@ -9,6 +9,7 @@ from src.config.logging import configure_logging
 from src.db.connection import engine, check_database_health
 from src.kafka.producer import get_producer
 from src.middleware.llm_interceptor import LLMInterceptorMiddleware
+from src.api.auth import require_api_key
 from src.api.routers import health, metrics, pipeline, models, audit, shadow, training, drift, eval, attribution, knowledge
 
 configure_logging()
@@ -51,17 +52,29 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(LLMInterceptorMiddleware)
 
+    # Open: k8s probes and the Prometheus scraper cannot present a key.
     app.include_router(health.router, tags=["Health"])
     app.include_router(metrics.router, tags=["Metrics"])
-    app.include_router(pipeline.router, prefix="/pipeline", tags=["Pipeline"])
-    app.include_router(models.router, prefix="/models", tags=["Models"])
-    app.include_router(audit.router, prefix="/audit", tags=["Audit"])
-    app.include_router(shadow.router, prefix="/shadow", tags=["Shadow"])
-    app.include_router(training.router, prefix="/training", tags=["Training"])
-    app.include_router(drift.router, prefix="/drift", tags=["Drift"])
-    app.include_router(eval.router, prefix="/eval", tags=["Eval"])
-    app.include_router(attribution.router, prefix="/attribution", tags=["Attribution"])
-    app.include_router(knowledge.router, prefix="/knowledge", tags=["Knowledge"])
+
+    # Authenticated: the control plane. These mutate production state (model
+    # rollback, pipeline pause, knowledge-base ingest) or expose non-public
+    # records (audit trail, model registry), and the k8s ingress publishes them.
+    protected = [Depends(require_api_key)]
+    app.include_router(pipeline.router, prefix="/pipeline", tags=["Pipeline"], dependencies=protected)
+    app.include_router(models.router, prefix="/models", tags=["Models"], dependencies=protected)
+    app.include_router(audit.router, prefix="/audit", tags=["Audit"], dependencies=protected)
+    app.include_router(shadow.router, prefix="/shadow", tags=["Shadow"], dependencies=protected)
+    app.include_router(training.router, prefix="/training", tags=["Training"], dependencies=protected)
+    app.include_router(drift.router, prefix="/drift", tags=["Drift"], dependencies=protected)
+    app.include_router(eval.router, prefix="/eval", tags=["Eval"], dependencies=protected)
+    app.include_router(attribution.router, prefix="/attribution", tags=["Attribution"], dependencies=protected)
+    app.include_router(knowledge.router, prefix="/knowledge", tags=["Knowledge"], dependencies=protected)
+
+    # Test/demo only: a no-op endpoint the traffic simulator's --mode http hits
+    # so the interceptor middleware has a request to capture. Never in production.
+    if settings.sim_traffic_enabled:
+        from src.api.routers import sim
+        app.include_router(sim.router, tags=["Sim"])
 
     return app
 
