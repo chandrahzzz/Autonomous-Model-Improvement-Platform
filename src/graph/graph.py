@@ -37,6 +37,28 @@ from src.graph.edges import (
 log = structlog.get_logger()
 
 
+RAGAS_SCORE_KEYS = ("faithfulness", "answer_relevancy", "context_recall")
+
+
+def _promoted_scores(state: PipelineState) -> dict | None:
+    """RAGAS scores to carry forward as the new incumbent baseline.
+
+    The challenger just won the gates, so its scores on the locked eval-set
+    snapshot become the bar the next challenger must clear. Returns None when
+    the scores aren't all present, so a partial result can't silently lower it.
+    """
+    eval_result = state.get("eval_result") or {}
+    if not isinstance(eval_result, dict):
+        return None
+    scores = {}
+    for key in RAGAS_SCORE_KEYS:
+        value = eval_result.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        scores[key] = float(value)
+    return scores
+
+
 async def promote_model_node(state: PipelineState) -> PipelineState:
     """Executes the actual DB promotion after audit is written."""
     from src.db.connection import get_db
@@ -74,9 +96,32 @@ async def promote_model_node(state: PipelineState) -> PipelineState:
     except Exception:
         log.error("baseline_refresh_failed", version_tag=version_tag)
 
+    # End the shadow test for this version.
+    try:
+        from src.shadow.service import _get_router
+        await _get_router().clear_challenger()
+    except Exception:
+        log.warning("shadow_challenger_clear_failed", version_tag=version_tag)
+
+    # Advance the incumbent baseline to the model we just promoted.
+    #
+    # incumbent_scores was set once from hardcoded defaults and never updated, so
+    # promotion Gate 4 measured every future challenger against those frozen
+    # constants instead of the model actually in production. A v9 that regressed
+    # against v8 could still clear the bar by beating the original seed numbers —
+    # the quality ratchet never ratcheted. Prefer the incumbent's scores measured
+    # on the locked eval-set snapshot; fall back to the challenger's own scores.
+    new_incumbent = _promoted_scores(state)
+    updates = {"production_version": version_tag}
+    if new_incumbent:
+        updates["incumbent_scores"] = new_incumbent
+        log.info("incumbent_scores_advanced", version_tag=version_tag, **new_incumbent)
+    else:
+        log.warning("incumbent_scores_not_advanced", version_tag=version_tag)
+
     return {
         **state,
-        "production_version": version_tag,
+        **updates,
         "training_triggered": False,
         "modal_job_id": None,
         "training_status": "idle",
@@ -85,6 +130,10 @@ async def promote_model_node(state: PipelineState) -> PipelineState:
         "canary_active": False,
         "version_tag": None,
         "rollback_reason": None,
+        # Clear the decision too: audit_logger_node infers its event type from
+        # state, so a sticky promotion_decision would make the next cycle's
+        # failure-detection audit entry mislabel itself as "model_promoted".
+        "promotion_decision": None,
         # Clear transient error markers so they don't leak into the next cycle (#L2).
         "error": None,
         "error_node": None,
@@ -241,6 +290,7 @@ def build_graph() -> StateGraph:
 
     # Linear edges
     builder.add_edge("log_monitor", "failure_detector")
+    builder.add_edge("audit_logger", "example_curator")
     builder.add_edge("example_curator", "data_validator")
     builder.add_edge("audit_logger_pre_train", "lora_trainer")
     builder.add_edge("lora_trainer", "training_poller")
@@ -253,7 +303,7 @@ def build_graph() -> StateGraph:
     builder.add_conditional_edges(
         "failure_detector",
         after_failure_detector,
-        {"example_curator": "example_curator", "data_validator": "data_validator"},
+        {"audit_logger": "audit_logger", "data_validator": "data_validator"},
     )
     builder.add_conditional_edges(
         "data_validator",

@@ -22,10 +22,17 @@ _factory_redis = None
 
 
 def _get_openai():
+    """Chat-completions client for the eval factory. $0 stack: AsyncGroq (free
+    tier), which is interface-compatible with AsyncOpenAI. Falls back to OpenAI
+    only when a Groq key is absent but an OpenAI key is set."""
     global _openai_client
     if _openai_client is None:
-        from openai import AsyncOpenAI
-        _openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+        if settings.groq_api_key:
+            from groq import AsyncGroq
+            _openai_client = AsyncGroq(api_key=settings.groq_api_key)
+        else:
+            from openai import AsyncOpenAI
+            _openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
     return _openai_client
 
 
@@ -60,18 +67,50 @@ async def _run_eval_factory_task(log_ids: list) -> None:
         log.exception("eval_factory_task_error")
 
 
+async def _filter_unprocessed(log_ids: list[str]) -> list[str]:
+    """Drop ids already handed to the detectors in an earlier cycle.
+
+    The query window is a rolling hour but the cycle is a minute, so without
+    this the same rows are re-classified every cycle — burning NLI/embedding
+    compute and feeding the drift detector duplicate samples. Fails OPEN (returns
+    everything) on any Redis problem: re-processing is wasteful, dropping logs is
+    a correctness bug.
+    """
+    if not settings.log_dedup_enabled or not log_ids:
+        return log_ids
+    try:
+        r = _get_factory_redis()
+        key = settings.log_dedup_key
+        seen_flags = await r.smismember(key, log_ids)
+        fresh = [lid for lid, seen in zip(log_ids, seen_flags) if not seen]
+        if fresh:
+            await r.sadd(key, *fresh)
+            await r.expire(key, settings.log_dedup_ttl_seconds)
+        return fresh
+    except Exception:
+        log.warning("log_dedup_failed_open", n_ids=len(log_ids))
+        return log_ids
+
+
 async def log_monitor_node(state: PipelineState) -> PipelineState:
     cycle_id = str(uuid.uuid4())
     log.info("log_monitor_node_start", cycle_id=cycle_id)
     async with AsyncSessionLocal() as db:
         repo = LLMLogRepository(db)
         recent = await repo.get_recent(limit=BATCH_SIZE, hours=1)
-    recent_log_ids = [str(r.id) for r in recent]
+    fetched_ids = [str(r.id) for r in recent]
+    recent_log_ids = await _filter_unprocessed(fetched_ids)
+    if len(recent_log_ids) != len(fetched_ids):
+        log.info(
+            "log_monitor_skipped_already_processed",
+            fetched=len(fetched_ids),
+            fresh=len(recent_log_ids),
+        )
     updates = {
         "cycle_id": cycle_id,
         "cycle_start_at": datetime.utcnow().isoformat(),
         "recent_log_ids": recent_log_ids,
-        "log_batch_size": len(recent),
+        "log_batch_size": len(recent_log_ids),
         "error": None,
     }
 
@@ -86,5 +125,5 @@ async def log_monitor_node(state: PipelineState) -> PipelineState:
         except Exception:
             log.warning("eval_factory_trigger_failed")
 
-    log.info("log_monitor_node_complete", n_logs=len(recent))
+    log.info("log_monitor_node_complete", n_logs=len(recent_log_ids))
     return {**state, **updates}

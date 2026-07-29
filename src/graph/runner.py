@@ -67,6 +67,12 @@ class PipelineRunner:
         self._graph = compile_graph()
         self._running = False
         self._consecutive_fast_cycles = 0
+        # Counts every loop iteration. The graph-state `cycles_completed` cannot
+        # be used for scheduling: it is only ever incremented by
+        # promote_model_node, so it stays 0 through normal monitoring and the
+        # `cycle % interval` maintenance jobs below (baseline refresh, DLQ
+        # replay, calibration, shadow_logs pruning) never fired at all.
+        self._cycle_count = 0
         self._state: dict = {
             "cycles_completed": 0,
             "paused": False,
@@ -169,8 +175,7 @@ class PipelineRunner:
         wasted GPU/teacher spend. Here we refresh whenever a baseline exceeds its
         max age, gated by enough fresh known-good samples."""
         interval = settings.baseline_refresh_check_interval_cycles
-        cycle = self._state.get("cycles_completed", 0)
-        if interval <= 0 or cycle == 0 or cycle % interval != 0:
+        if not self._due(interval):
             return
         try:
             from src.graph.nodes.failure_detector import _drift, _fmt
@@ -203,10 +208,20 @@ class PipelineRunner:
         # Reset it per session; the durable lifetime total lives in Postgres (#L4).
         self._state["cycles_completed"] = 0
 
-        # Register graceful shutdown handlers
+        # Register graceful shutdown handlers. asyncio's loop.add_signal_handler
+        # is not implemented on Windows (ProactorEventLoop), so fall back to the
+        # blocking signal.signal there — and if even that isn't available (e.g. a
+        # non-main thread), skip it: signal handling is a clean-shutdown nicety,
+        # not required for the loop to run.
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._shutdown)
+            try:
+                loop.add_signal_handler(sig, self._shutdown)
+            except (NotImplementedError, RuntimeError):
+                try:
+                    signal.signal(sig, lambda *_: self._shutdown())
+                except (ValueError, OSError):
+                    log.warning("signal_handler_unavailable", signal=sig)
 
         while self._running:
             cycle_start = time.monotonic()
@@ -283,6 +298,8 @@ class PipelineRunner:
         self._state["error"] = None
         self._state["error_node"] = None
 
+        self._cycle_count += 1
+
         result = await self._graph.ainvoke(
             self._state,
             config={"configurable": {"thread_id": THREAD_ID}},
@@ -303,11 +320,16 @@ class PipelineRunner:
         await self._maybe_cleanup_shadow_logs()
         await self._maybe_replay_dlq()
 
+    def _due(self, interval: int) -> bool:
+        """True when a periodic job scheduled every ``interval`` cycles is due."""
+        if interval <= 0 or self._cycle_count == 0:
+            return False
+        return self._cycle_count % interval == 0
+
     async def _maybe_calibrate(self) -> None:
         """Periodically suggest detection-threshold adjustments from observed data."""
         interval = settings.calibration_interval_cycles
-        cycle = self._state.get("cycles_completed", 0)
-        if interval <= 0 or cycle == 0 or cycle % interval != 0:
+        if not self._due(interval):
             return
         try:
             from src.db.connection import get_db
@@ -341,8 +363,7 @@ class PipelineRunner:
     async def _maybe_cleanup_shadow_logs(self) -> None:
         """Prune shadow_logs past the retention window so it doesn't grow forever (#S3)."""
         interval = settings.shadow_logs_cleanup_interval_cycles
-        cycle = self._state.get("cycles_completed", 0)
-        if interval <= 0 or cycle == 0 or cycle % interval != 0:
+        if not self._due(interval):
             return
         try:
             from src.db.connection import get_db
@@ -361,8 +382,7 @@ class PipelineRunner:
         if not settings.dlq_replay_enabled:
             return
         interval = settings.dlq_replay_interval_cycles
-        cycle = self._state.get("cycles_completed", 0)
-        if interval <= 0 or cycle == 0 or cycle % interval != 0:
+        if not self._due(interval):
             return
         try:
             from src.kafka.dlq_consumer import DLQReplayer

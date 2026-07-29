@@ -17,15 +17,11 @@ log = structlog.get_logger()
 async def lora_trainer_node(state: PipelineState) -> PipelineState:
     async with get_db() as db:
         repo = ModelRepository(db)
-        prod = await repo.get_production_version()
-        current_version = prod.version_tag if prod else "v7"
-
-        # Determine next version tag
-        try:
-            n = int(current_version.lstrip("v")) + 1
-        except (ValueError, AttributeError):
-            n = 8
-        version_tag = f"v{n}"
+        # Next tag comes from the highest version ever created, NOT from the
+        # production pointer. After a rollback production stays behind while the
+        # failed version row remains, so deriving from production reissued a tag
+        # that already exists and tripped the UNIQUE constraint on version_tag.
+        version_tag = await repo.next_version_tag()
 
         lora_config = LoRAConfig()
         run_data = {
@@ -44,10 +40,17 @@ async def lora_trainer_node(state: PipelineState) -> PipelineState:
     # dataset_uri only once that write is confirmed (#T4). In production, refuse to
     # submit if the artifact isn't resolvable — a failed job must never leave a
     # dangling dataset_uri that reproduce_dataset.py 404s on.
-    dataset_uri = await persist_dataset_to_volume(dataset_path, version_tag)
-    if dataset_uri is not None:
-        dataset_uri = dataset_uri if await dataset_uri_resolvable(version_tag) else None
-    if dataset_uri is None and settings.environment == "production":
+    #
+    # Colab-primary backend has no Modal Volume: the dataset is inlined into the
+    # webhook POST instead, so skip the volume persist entirely (dataset_uri stays
+    # None; reproduce_dataset.py doesn't apply to Colab runs).
+    if settings.training_backend == "colab":
+        dataset_uri = None
+    else:
+        dataset_uri = await persist_dataset_to_volume(dataset_path, version_tag)
+        if dataset_uri is not None:
+            dataset_uri = dataset_uri if await dataset_uri_resolvable(version_tag) else None
+    if dataset_uri is None and settings.training_backend != "colab" and settings.environment == "production":
         async with get_db() as db:
             await ModelRepository(db).update_training_run(run.id, {
                 "status": "failed",

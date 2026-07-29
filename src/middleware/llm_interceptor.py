@@ -107,6 +107,13 @@ class LLMInterceptorMiddleware(BaseHTTPMiddleware):
             llm_tokens_counter.labels(token_type="completion").inc(completion_tokens)
             llm_cost_counter.inc(cost)
 
+            # Feed the shadow A/B window. Already off the request path (this runs
+            # in a create_task), and no-ops after one Redis GET when no challenger
+            # is in shadow, so serving latency is unaffected.
+            from src.shadow.service import observe_production_call
+
+            await observe_production_call(event.prompt, event.completion)
+
         except Exception:
             log.exception("llm_interceptor_emit_failed")
 

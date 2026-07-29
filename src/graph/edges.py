@@ -11,8 +11,12 @@ from src.graph.state import PipelineState
 
 
 def after_failure_detector(state: PipelineState) -> str:
+    # Detected failures are audited BEFORE curation acts on them, consistent with
+    # the write-before-act rule the training/promotion/rollback paths follow.
+    # The audit_logger node existed but nothing routed to it, so
+    # failure_batch_detected entries were never written to the audit trail.
     if state.get("has_failures"):
-        return "example_curator"
+        return "audit_logger"
     return "data_validator"
 
 
